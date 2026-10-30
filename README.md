@@ -165,6 +165,21 @@ Logs, databases, session files, credentials, and machine-specific investigation
 notes are excluded from this repository. Before sharing a bug report, redact
 session text, IDs, paths, pairing links, and tokens from any excerpts.
 
+## Credits
+
+- [T3 Code](https://github.com/pingdotgg/t3code) by T3 Tools Inc. provides the
+  native scanner, importer, provider adapters, and application extended by this patch.
+- [CarlosGtrz/t3-import](https://github.com/CarlosGtrz/t3-import) provided an
+  important reference for Claude transcript parsing. Its
+  [Claude parser](https://github.com/CarlosGtrz/t3-import/blob/5e20fb5709aa7ad6ce0853e210426c551066d7e0/src/sources/claude.ts)
+  informed our conversation-branch selection and compaction handling, adapted here
+  to T3's v2 import service. Thanks to Carlos and the t3-import contributors.
+- [rafay99-epic/claude-code-to-t3](https://github.com/rafay99-epic/claude-code-to-t3)
+  was also reviewed during compatibility research.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for source references and
+upstream license notices.
+
 ## Development and verification
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for tests, patch regeneration, and pull
