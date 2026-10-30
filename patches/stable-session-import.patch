@@ -1,0 +1,2580 @@
+diff --git a/apps/server/src/binCli.ts b/apps/server/src/binCli.ts
+index 2f7c24536c..278abb381e 100644
+--- a/apps/server/src/binCli.ts
++++ b/apps/server/src/binCli.ts
+@@ -1,4 +1,5 @@
+ import { doctorCommand } from "./cli/doctor.ts";
++import { importSessionCommand } from "./cli/importSession.ts";
+ import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import * as Effect from "effect/Effect";
+@@ -89,6 +90,7 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
+       themeCommand,
+       traceCommand,
+       doctorCommand,
++      importSessionCommand,
+       triageCommand,
+       cloudEnabled ? connectCommand : connectUnavailableCommand,
+     ]),
+diff --git a/apps/server/src/cli/importSession.ts b/apps/server/src/cli/importSession.ts
+new file mode 100644
+index 0000000000..68d9dc296d
+--- /dev/null
++++ b/apps/server/src/cli/importSession.ts
+@@ -0,0 +1,64 @@
++import {
++  AgentSessionImportInput,
++  EnvironmentHttpApi,
++  ORCHESTRATION_PROTOCOL_HEADER,
++  ProjectId,
++} from "@t3tools/contracts";
++import * as Console from "effect/Console";
++import * as Effect from "effect/Effect";
++import * as Option from "effect/Option";
++import { Argument, Command, Flag } from "effect/cli";
++import { FetchHttpClient, HttpClient } from "effect/http";
++import * as HttpApiClient from "effect/http-api/HttpApiClient";
++
++const importProviderSessionCommand = Command.make("session", {
++  baseUrl: Flag.String("base-url").pipe(
++    Flag.withDescription("Origin of the running T3 server, for example http://127.0.0.1:3000."),
++  ),
++  token: Flag.String("token").pipe(
++    Flag.withDescription("Bearer session token with orchestration:operate access."),
++  ),
++  projectId: Argument.String("project-id").pipe(
++    Argument.withDescription("T3 project ID to receive the imported session."),
++  ),
++  sessionId: Argument.String("session-id").pipe(
++    Argument.withDescription("Claude or Codex native session ID."),
++  ),
++  workspace: Flag.String("workspace").pipe(
++    Flag.withDescription("Expected project workspace path; prevents importing into a moved project."),
++    Flag.optional,
++  ),
++  includeOlder: Flag.Boolean("include-older").pipe(
++    Flag.withDescription("Include sessions older than the normal discovery window."),
++  ),
++}).pipe(
++  Command.withDescription("Import one existing Claude or Codex session into a live T3 project."),
++  Command.withHandler((flags) =>
++    Effect.gen(function* () {
++      const client = yield* HttpApiClient.make(EnvironmentHttpApi, {
++        baseUrl: flags.baseUrl,
++      });
++      const input = {
++        projectId: ProjectId.make(flags.projectId),
++        ...(Option.isNone(flags.workspace) ? {} : { expectedWorkspaceRoot: flags.workspace.value }),
++        sessionId: flags.sessionId,
++        includeOlder: flags.includeOlder,
++      } satisfies AgentSessionImportInput;
++      const result = yield* client.agentSessions.import({
++        headers: {
++          authorization: `Bearer ${flags.token}`,
++          [ORCHESTRATION_PROTOCOL_HEADER]: "2",
++        },
++        payload: input,
++      });
++      yield* Console.log(
++        `Imported ${result.importedCount} session(s); skipped ${result.skippedCount}.`,
++      );
++    }).pipe(Effect.provide(FetchHttpClient.layer)),
++  ),
++);
++
++export const importSessionCommand = Command.make("import").pipe(
++  Command.withDescription("Import existing provider sessions into T3."),
++  Command.withSubcommands([importProviderSessionCommand]),
++);
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+index 7fece9817c..9dab6f2496 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+@@ -2323,7 +2323,7 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
+ });
+ 
+ describe("ClaudeAdapterV2 native session identity", () => {
+-  const openTurnWithOrdinal = (providerTurnOrdinal: number, nativeThreadHasTurns?: boolean) =>
++  const openTurnWithOrdinal = (providerTurnOrdinal: number, nativeThreadHasTurns?: boolean, imported = false) =>
+     Effect.scoped(
+       Effect.gen(function* () {
+         const fileSystem = yield* FileSystem.FileSystem;
+@@ -2376,6 +2376,7 @@ describe("ClaudeAdapterV2 native session identity", () => {
+           modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+           runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+         });
++        if (imported) yield* runtime.resumeThread({ providerThread });
+         const now = yield* DateTime.now;
+         yield* runtime.startTurn(
+           makeClaudeTestTurnInput({
+@@ -2408,6 +2409,14 @@ describe("ClaudeAdapterV2 native session identity", () => {
+       }),
+   );
+ 
++  it.effect("resumes an imported session before its first T3 provider turn", () =>
++    Effect.gen(function* () {
++      const openedQueries = yield* openTurnWithOrdinal(1, false, true);
++      assert.equal(openedQueries[0]?.options.resume, "native-session-identity");
++      assert.equal(openedQueries[0]?.options.sessionId, undefined);
++    }),
++  );
++
+   it.effect("creates a fresh native session despite earlier provider-thread turns", () =>
+     Effect.gen(function* () {
+       const openedQueries = yield* openTurnWithOrdinal(4, false);
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+index 94ccc16dda..0e7727f08a 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+@@ -2615,7 +2615,7 @@ const CLAUDE_KNOWN_TOOL_CLASSIFICATIONS: Record<
+   write: { itemType: "file_change", requestKind: "file-change" },
+ };
+ 
+-function classifyClaudeNativeTool(toolName: string): ClaudeToolClassification {
++export function classifyClaudeNativeTool(toolName: string): ClaudeToolClassification {
+   const normalizedName = normalizedClaudeToolName(toolName);
+   const known = CLAUDE_KNOWN_TOOL_CLASSIFICATIONS[normalizedName];
+   return known === undefined
+@@ -2665,7 +2665,7 @@ const EMPTY_CLAUDE_NATIVE_TOOL_INPUT = {
+   value: {},
+ } satisfies ClaudeNativeToolInput;
+ 
+-function claudeNativeToolInputFromUnknown(input: unknown): ClaudeNativeToolInput {
++export function claudeNativeToolInputFromUnknown(input: unknown): ClaudeNativeToolInput {
+   return isClaudeNativeToolInputRecord(input)
+     ? { type: "record", value: input }
+     : { type: "non_record", value: input };
+@@ -2967,6 +2967,140 @@ function webSearchResultsFromClaudeOutput(
+   });
+ }
+ 
++type ClaudeToolTurnItemBase = Pick<
++  Extract<OrchestrationV2TurnItem, { readonly type: "dynamic_tool" }>,
++  | "id"
++  | "threadId"
++  | "runId"
++  | "nodeId"
++  | "providerThreadId"
++  | "providerTurnId"
++  | "nativeItemRef"
++  | "parentItemId"
++  | "ordinal"
++  | "status"
++  | "startedAt"
++  | "completedAt"
++  | "updatedAt"
++> & { readonly toolNonExecutionKind?: string };
++
++// Session import reuses this so historical tool calls render exactly like live ones.
++export function claudeToolTurnItem(input: {
++  readonly base: ClaudeToolTurnItemBase;
++  readonly classification: ClaudeToolClassification;
++  readonly toolName: string;
++  readonly toolInput: ClaudeNativeToolInput;
++  readonly output: ClaudeNativeToolOutput;
++  readonly presentation: ClaudeToolPresentation | undefined;
++}): OrchestrationV2TurnItem {
++  const readPath = ["read", "read file"].includes(input.classification.normalizedName)
++    ? firstStringInputField(input.toolInput, ["file_path", "path"])?.trim()
++    : undefined;
++  const nativeToolInput = claudeNativeToolInputValue(input.toolInput);
++  const searchTitle = ["grep", "glob", "ls"].includes(input.classification.normalizedName)
++    ? formatSearchToolLabel({
++        input:
++          nativeToolInput !== null &&
++          typeof nativeToolInput === "object" &&
++          !Array.isArray(nativeToolInput)
++            ? (nativeToolInput as Record<string, unknown>)
++            : undefined,
++      })
++    : undefined;
++  const itemBase = {
++    ...input.base,
++    title:
++      readPath !== undefined
++        ? formatReadToolLabel(readPath)
++        : (searchTitle ??
++          dynamicToolTitle(input.toolName, nativeToolInput) ??
++          input.presentation?.title ??
++          null),
++  };
++  const viewedImagePath =
++    readPath &&
++    readPath.length <= 4096 &&
++    !/[\r\n]/.test(readPath) &&
++    isWorkspaceImagePreviewPath(readPath)
++      ? readPath
++      : undefined;
++  const itemType = input.classification.itemType;
++  const webSearchPatterns = webSearchPatternsFromClaudeTool({
++    toolInput: input.toolInput,
++    output: input.output,
++  });
++  const webSearchResults = webSearchResultsFromClaudeOutput(input.output);
++  const webFetchUrl = firstStringInputField(input.toolInput, ["url"])?.trim();
++  const outputValue = claudeNativeToolOutputValue(input.output);
++  const outputText =
++    itemType === "command_execution"
++      ? claudeCommandOutputText(input.output)
++      : claudeNativeToolOutputText(input.output);
++  return itemType === "command_execution"
++    ? {
++        ...itemBase,
++        type: "command_execution",
++        input: commandInputFromClaudeTool(input.toolName, input.toolInput),
++        ...(outputText.length === 0 ? {} : { output: outputText }),
++      }
++    : itemType === "file_change"
++      ? {
++          ...itemBase,
++          type: "file_change",
++          fileName: fileNameFromClaudeTool(input.toolName, input.toolInput),
++          ...(outputText.length === 0 ? {} : { diffStr: outputText }),
++        }
++      : itemType === "web_search"
++        ? {
++            ...itemBase,
++            type: "web_search",
++            ...(webSearchPatterns.length === 0 ? {} : { patterns: [...webSearchPatterns] }),
++            ...(webSearchResults.length > 0
++              ? { results: [...webSearchResults] }
++              : input.classification.normalizedName === "webfetch" && outputText.trim().length > 0
++                ? {
++                    results: [
++                      {
++                        ...(webFetchUrl === undefined ? {} : { url: webFetchUrl }),
++                        snippet: outputText.slice(0, WEB_FETCH_SNIPPET_MAX_CHARS),
++                      },
++                    ],
++                  }
++                : {}),
++          }
++        : {
++            ...itemBase,
++            type: "dynamic_tool",
++            ...(input.presentation?.toolIcon === undefined
++              ? {}
++              : { toolIcon: input.presentation.toolIcon }),
++            ...(input.presentation?.toolSource === undefined
++              ? {}
++              : { toolSource: input.presentation.toolSource }),
++            toolName: input.toolName,
++            ...(viewedImagePath === undefined ? {} : { viewedImagePath }),
++            input: nativeToolInput,
++            ...(outputValue === undefined ? {} : { output: outputValue }),
++          };
++}
++
++// Transcripts store a tool's structured result beside its content block, as the SDK reports it live.
++export function claudeTranscriptToolOutput(
++  content: unknown,
++  structuredOutput: unknown,
++): ClaudeNativeToolOutput {
++  const fallbackValue = content as ClaudeToolResultOutput | undefined;
++  if (structuredOutput !== undefined) {
++    return claudeNativeToolOutputFromStructuredResult({
++      structuredOutput,
++      ...(fallbackValue === undefined ? {} : { fallbackValue }),
++    });
++  }
++  return fallbackValue === undefined
++    ? NO_CLAUDE_NATIVE_TOOL_OUTPUT
++    : { type: "content_block", value: fallbackValue };
++}
++
+ function summarizeClaudeToolRequest(toolName: string, input: ClaudeNativeToolInput): string {
+   const command = firstStringInputField(input, ["command", "cmd", "script"]);
+   if (command !== undefined) {
+@@ -4039,7 +4173,7 @@ export function claudeSdkUserInputAnswers(
+   );
+ }
+ 
+-function claudeTodoSteps(input: unknown): ReadonlyArray<OrchestrationV2PlanStep> {
++export function claudeTodoSteps(input: unknown): ReadonlyArray<OrchestrationV2PlanStep> {
+   const value =
+     typeof input === "object" && input !== null && Reflect.get(input, "type") === "record"
+       ? Reflect.get(input, "value")
+@@ -4207,7 +4341,7 @@ function claudeTaskSteps(tasks: ClaudeTaskList): ReadonlyArray<OrchestrationV2Pl
+   return [...tasks].map(([id, task]) => ({ id: `task-${id}`, ...task }));
+ }
+ 
+-function claudeProposedPlan(input: unknown): string | null {
++export function claudeProposedPlan(input: unknown): string | null {
+   const value =
+     typeof input === "object" && input !== null && Reflect.get(input, "type") === "record"
+       ? Reflect.get(input, "value")
+@@ -5328,131 +5462,32 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+             startedAt: input.startedAt,
+             completedAt,
+           };
+-          const readPath = ["read", "read file"].includes(input.classification.normalizedName)
+-            ? firstStringInputField(input.toolInput, ["file_path", "path"])?.trim()
+-            : undefined;
+-          const nativeToolInput = claudeNativeToolInputValue(input.toolInput);
+-          const searchTitle = ["grep", "glob", "ls"].includes(input.classification.normalizedName)
+-            ? formatSearchToolLabel({
+-                input:
+-                  nativeToolInput !== null &&
+-                  typeof nativeToolInput === "object" &&
+-                  !Array.isArray(nativeToolInput)
+-                    ? (nativeToolInput as Record<string, unknown>)
+-                    : undefined,
+-              })
+-            : undefined;
+-          const itemBase = {
+-            ...(input.toolNonExecutionKind === undefined
+-              ? {}
+-              : { toolNonExecutionKind: input.toolNonExecutionKind }),
+-            id: turnItemId,
+-            threadId: input.threadId,
+-            runId: input.runId,
+-            nodeId,
+-            providerThreadId:
+-              input.runId === null ? null : (input.context?.input.providerThread.id ?? null),
+-            providerTurnId: input.runId === null ? null : (input.context?.providerTurnId ?? null),
+-            nativeItemRef,
+-            parentItemId: null,
+-            ordinal: input.ordinal,
+-            status: input.status,
+-            title:
+-              readPath !== undefined
+-                ? formatReadToolLabel(readPath)
+-                : (searchTitle ??
+-                  dynamicToolTitle(input.toolName, nativeToolInput) ??
+-                  input.presentation?.title ??
+-                  null),
+-            startedAt: input.startedAt,
+-            completedAt,
+-            updatedAt: input.updatedAt,
+-          } satisfies Pick<
+-            OrchestrationV2TurnItem,
+-            | "id"
+-            | "threadId"
+-            | "runId"
+-            | "nodeId"
+-            | "providerThreadId"
+-            | "providerTurnId"
+-            | "nativeItemRef"
+-            | "parentItemId"
+-            | "ordinal"
+-            | "status"
+-            | "title"
+-            | "startedAt"
+-            | "completedAt"
+-            | "updatedAt"
+-          >;
+-          const viewedImagePath =
+-            readPath &&
+-            readPath.length <= 4096 &&
+-            !/[\r\n]/.test(readPath) &&
+-            isWorkspaceImagePreviewPath(readPath)
+-              ? readPath
+-              : undefined;
+-          const itemType = input.classification.itemType;
+-          const webSearchPatterns = webSearchPatternsFromClaudeTool({
++          const turnItem = claudeToolTurnItem({
++            base: {
++              ...(input.toolNonExecutionKind === undefined
++                ? {}
++                : { toolNonExecutionKind: input.toolNonExecutionKind }),
++              id: turnItemId,
++              threadId: input.threadId,
++              runId: input.runId,
++              nodeId,
++              providerThreadId:
++                input.runId === null ? null : (input.context?.input.providerThread.id ?? null),
++              providerTurnId: input.runId === null ? null : (input.context?.providerTurnId ?? null),
++              nativeItemRef,
++              parentItemId: null,
++              ordinal: input.ordinal,
++              status: input.status,
++              startedAt: input.startedAt,
++              completedAt,
++              updatedAt: input.updatedAt,
++            },
++            classification: input.classification,
++            toolName: input.toolName,
+             toolInput: input.toolInput,
+             output: input.output,
++            presentation: input.presentation,
+           });
+-          const webSearchResults = webSearchResultsFromClaudeOutput(input.output);
+-          const webFetchUrl = firstStringInputField(input.toolInput, ["url"])?.trim();
+-          const outputValue = claudeNativeToolOutputValue(input.output);
+-          const outputText =
+-            itemType === "command_execution"
+-              ? claudeCommandOutputText(input.output)
+-              : claudeNativeToolOutputText(input.output);
+-          const turnItem: OrchestrationV2TurnItem =
+-            itemType === "command_execution"
+-              ? {
+-                  ...itemBase,
+-                  type: "command_execution",
+-                  input: commandInputFromClaudeTool(input.toolName, input.toolInput),
+-                  ...(outputText.length === 0 ? {} : { output: outputText }),
+-                }
+-              : itemType === "file_change"
+-                ? {
+-                    ...itemBase,
+-                    type: "file_change",
+-                    fileName: fileNameFromClaudeTool(input.toolName, input.toolInput),
+-                    ...(outputText.length === 0 ? {} : { diffStr: outputText }),
+-                  }
+-                : itemType === "web_search"
+-                  ? {
+-                      ...itemBase,
+-                      type: "web_search",
+-                      ...(webSearchPatterns.length === 0
+-                        ? {}
+-                        : { patterns: [...webSearchPatterns] }),
+-                      ...(webSearchResults.length > 0
+-                        ? { results: [...webSearchResults] }
+-                        : input.classification.normalizedName === "webfetch" &&
+-                            outputText.trim().length > 0
+-                          ? {
+-                              results: [
+-                                {
+-                                  ...(webFetchUrl === undefined ? {} : { url: webFetchUrl }),
+-                                  snippet: outputText.slice(0, WEB_FETCH_SNIPPET_MAX_CHARS),
+-                                },
+-                              ],
+-                            }
+-                          : {}),
+-                    }
+-                  : {
+-                      ...itemBase,
+-                      type: "dynamic_tool",
+-                      ...(input.presentation?.toolIcon === undefined
+-                        ? {}
+-                        : { toolIcon: input.presentation.toolIcon }),
+-                      ...(input.presentation?.toolSource === undefined
+-                        ? {}
+-                        : { toolSource: input.presentation.toolSource }),
+-                      toolName: input.toolName,
+-                      ...(viewedImagePath === undefined ? {} : { viewedImagePath }),
+-                      input: claudeNativeToolInputValue(input.toolInput),
+-                      ...(outputValue === undefined ? {} : { output: outputValue }),
+-                    };
+           return { node, turnItem };
+         };
+ 
+@@ -9767,6 +9802,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+               options: queryOptions,
+             })
+             .pipe(
++              Effect.tapError((cause) =>
++                Effect.logWarning("orchestration-v2.claude-query-open-failed", {
++                  nativeThreadId,
++                  resume: queryOptions.resume,
++                  cause,
++                }),
++              ),
+               Effect.onError(() =>
+                 closedExistingNativeThreadId === nativeThreadId
+                   ? Effect.gen(function* () {
+@@ -10614,6 +10656,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+                   detail: `Claude session ${nativeThreadId} has no conversation to resume.`,
+                 });
+               }
++              if (nativeThreadId !== undefined && nativeThreadId !== null) {
++                yield* Ref.update(openedNativeThreads, (current) => {
++                  if (current.has(nativeThreadId)) return current;
++                  const updated = new Set(current);
++                  updated.add(nativeThreadId);
++                  return updated;
++                });
++              }
+               const updatedAt = yield* DateTime.now;
+               return {
+                 ...threadInput.providerThread,
+diff --git a/apps/server/src/project/AgentSessionHttp.ts b/apps/server/src/project/AgentSessionHttp.ts
+new file mode 100644
+index 0000000000..220f9b4e94
+--- /dev/null
++++ b/apps/server/src/project/AgentSessionHttp.ts
+@@ -0,0 +1,28 @@
++import { AuthOrchestrationOperateScope, EnvironmentHttpApi } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
++
++import {
++  annotateEnvironmentRequest,
++  failEnvironmentInternal,
++  requireEnvironmentScope,
++} from "../auth/http.ts";
++import * as AgentSessionImporter from "./AgentSessionImporter.ts";
++
++export const layer = HttpApiBuilder.group(
++  EnvironmentHttpApi,
++  "agentSessions",
++  Effect.fnUntraced(function* (handlers) {
++    const importer = yield* AgentSessionImporter.AgentSessionImporter;
++    return handlers.handle(
++      "import",
++      Effect.fn("environment.agentSessions.import")(function* (args) {
++        yield* annotateEnvironmentRequest(args.endpoint.name);
++        yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
++        return yield* importer.importRecentAgentThreads(args.payload).pipe(
++          Effect.catch((cause) => failEnvironmentInternal("orchestration_snapshot_failed", cause)),
++        );
++      }),
++    );
++  }),
++);
+diff --git a/apps/server/src/project/AgentSessionImporter.test.ts b/apps/server/src/project/AgentSessionImporter.test.ts
+index 69026f9120..fed0d28b88 100644
+--- a/apps/server/src/project/AgentSessionImporter.test.ts
++++ b/apps/server/src/project/AgentSessionImporter.test.ts
+@@ -1,4 +1,7 @@
+ import { expect, it } from "@effect/vitest";
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
++import * as NodePath from "@effect/platform-node/NodePath";
+ import {
+   EventId,
+   ProjectId,
+@@ -14,13 +17,16 @@ import * as Context from "effect/Context";
+ import * as DateTime from "effect/DateTime";
+ import * as Deferred from "effect/Deferred";
+ import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
+ import * as Fiber from "effect/Fiber";
+ import * as Layer from "effect/Layer";
+ import * as Option from "effect/Option";
++import * as Path from "effect/Path";
+ import * as Stream from "effect/Stream";
+ import * as SqlClient from "effect/sql/SqlClient";
+ 
+ import * as EventSink from "../orchestration-v2/EventSink.ts";
++import * as ServerConfig from "../config.ts";
+ import * as EventStore from "../orchestration-v2/EventStore.ts";
+ import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+@@ -45,6 +51,12 @@ const persistence = Layer.mergeAll(
+   EventSink.layer.pipe(Layer.provide(stores)),
+   ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+   IdAllocator.layer,
++  NodeFileSystem.layer,
++  NodePath.layer,
++  ServerConfig.layerTest(process.cwd(), { prefix: "t3-importer-suite-" }).pipe(
++    Layer.provideMerge(NodeFileSystem.layer),
++    Layer.provideMerge(NodePath.layer),
++  ),
+ );
+ 
+ function candidate(
+@@ -166,6 +178,9 @@ const makeImporter = Effect.fn(function* (
+   beforeTransaction: Effect.Effect<void> = Effect.void,
+ ) {
+   const sql = yield* SqlClient.SqlClient;
++  const fileSystem = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const config = yield* ServerConfig.ServerConfig;
+   const events = yield* EventStore.EventStoreV2;
+   const projections = yield* ProjectionStore.ProjectionStoreV2;
+   const published: Array<ApplicationStoredEvent> = [];
+@@ -232,10 +247,25 @@ const makeImporter = Effect.fn(function* (
+           }),
+         ),
+       ),
++      Layer.provide(NodeServices.layer),
++      Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-importer-test-" })),
+     ),
+   );
+   const importer = Context.get(context, AgentSessionImporter.AgentSessionImporter);
+-  return { run: importer.importRecentAgentThreads({ projectId }), published };
++  return {
++    run: importer
++      .importRecentAgentThreads({ projectId })
++      .pipe(
++        Effect.provide(
++          Layer.mergeAll(
++            Layer.succeed(FileSystem.FileSystem, fileSystem),
++            Layer.succeed(Path.Path, path),
++            Layer.succeed(ServerConfig.ServerConfig, config),
++          ),
++        ),
++      ),
++    published,
++  };
+ });
+ 
+ it.effect(
+@@ -294,7 +324,7 @@ it.effect(
+           "providerThreads",
+         ]);
+         expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
+-        expect(records.thread.historyOrigin).toBe("v1_import");
++        expect(records.thread.historyOrigin).toBe("native");
+         expect(records.thread.activeProviderThreadId).toBe(records.providerThreads[0]?.id);
+         expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(
+           source.source.providerSessionId,
+@@ -311,6 +341,71 @@ it.effect(
+     }).pipe(Effect.scoped, Effect.provide(persistence)),
+ );
+ 
++it.effect("renders historical Claude tools and compactions as live Claude turns do", () =>
++  Effect.gen(function* () {
++    const projections = yield* ProjectionStore.ProjectionStoreV2;
++    const source = candidate(
++      CLAUDE_MODEL_SELECTION,
++      "8a3b1c1e-5d2f-4a7e-9b8c-1f2e3d4c5b6a",
++      "claudeAgent",
++    );
++    const tool = (
++      id: string,
++      name: string,
++      input: unknown,
++      content: unknown,
++      structuredOutput?: unknown,
++    ) => ({
++      kind: "tool" as const,
++      id,
++      name,
++      input,
++      output: null,
++      failed: false,
++      createdAt: timestamp,
++      completedAt: timestamp,
++      claudeResult: { content, structuredOutput },
++    });
++    const historical = {
++      ...source,
++      thread: {
++        ...source.thread,
++        messages: [
++          { role: "user" as const, text: "Continue after compaction", createdAt: timestamp },
++          {
++            role: "assistant" as const,
++            text: "",
++            createdAt: timestamp,
++            activities: [
++              { kind: "compaction" as const, createdAt: timestamp },
++              tool("toolu_bash", "Bash", { command: "ls" }, "ok", { stdout: "ok", stderr: "" }),
++              tool("toolu_edit", "Edit", { file_path: "/workspace/project/a.ts" }, "Updated"),
++              tool("toolu_search", "WebSearch", { query: "effect schema" }, "No results"),
++              tool("toolu_docs", "mcp__claude_ai_Claude_Docs__read", { id: "doc" }, "Doc body"),
++            ],
++          },
++        ],
++      },
++    };
++    const importer = yield* makeImporter([historical]);
++
++    expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
++    const records = yield* projections.getThreadRecords(importId(source), ["turnItems"]);
++    const items = records.turnItems.filter((item) => item.parentItemId !== null);
++    expect(items).toMatchObject([
++      { type: "compaction", title: "Context compacted" },
++      { type: "command_execution", input: "ls", output: "ok" },
++      { type: "file_change", fileName: "/workspace/project/a.ts" },
++      { type: "web_search", patterns: ["effect schema"] },
++      {
++        type: "dynamic_tool",
++        toolName: "mcp__claude_ai_Claude_Docs__read",
++        toolSource: expect.anything(),
++      },
++    ]);
++  }).pipe(Effect.scoped, Effect.provide(persistence)),
++);
++
+ it.effect("rechecks ownership after the import reaches the commit transaction", () =>
+   Effect.gen(function* () {
+     const enteringTransaction = yield* Deferred.make<void>();
+@@ -365,15 +460,15 @@ it.effect(
+       yield* sql`CREATE TEMP TRIGGER fail_runtime BEFORE INSERT ON provider_session_runtime BEGIN SELECT RAISE(ABORT, 'test runtime failure'); END`;
+       expect(yield* importer.run).toEqual({ importedCount: 0, skippedCount: 1 });
+       const committed = yield* events.read({ threadId }).pipe(Stream.runCollect);
+-      expect(committed).toHaveLength(6);
+-      expect(importer.published).toHaveLength(6);
++      expect(committed).toHaveLength(10);
++      expect(importer.published).toHaveLength(10);
+       expect(yield* runtimes.list()).toEqual([]);
+       yield* sql`DROP TRIGGER fail_runtime`;
+ 
+       expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+       expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+       expect(yield* events.read({ threadId }).pipe(Stream.runCollect)).toEqual(committed);
+-      expect(importer.published).toHaveLength(6);
++      expect(importer.published).toHaveLength(10);
+       expect(
+         (yield* projections.getThreadRecords(threadId, ["messages"])).messages.map(
+           (message) => message.text,
+diff --git a/apps/server/src/project/AgentSessionImporter.ts b/apps/server/src/project/AgentSessionImporter.ts
+index 11f168ff1d..150270a9e1 100644
+--- a/apps/server/src/project/AgentSessionImporter.ts
++++ b/apps/server/src/project/AgentSessionImporter.ts
+@@ -7,34 +7,56 @@ import {
+   AgentSessionImportProjectNotFoundError,
+   AgentSessionImportSource,
+   AgentSessionScanError,
++  ChatAttachmentId,
++  NodeId,
++  ProviderDriverKind,
++  ProviderThreadId,
++  ProviderTurnId,
+   AgentSessionSource,
+   EventId,
+   MessageId,
+   ProjectId,
+-  ProviderDriverKind,
+   ThreadId,
+   TurnItemId,
+   type AgentSessionImportInput,
+   type AgentSessionImportResult,
++  type ProviderInstanceId,
+   type OrchestrationV2AppThread,
+   type OrchestrationV2ConversationMessage,
+   type OrchestrationV2DomainEvent,
+   type OrchestrationV2ProviderThread,
+   type OrchestrationV2TurnItem,
++  type ChatAttachment,
+ } from "@t3tools/contracts";
+ import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
+ import * as Context from "effect/Context";
++import * as Base64 from "effect/encoding/Base64";
+ import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
+ import * as Layer from "effect/Layer";
+ import * as Option from "effect/Option";
++import * as Path from "effect/Path";
+ import * as Schema from "effect/Schema";
+ import * as Stream from "effect/Stream";
+ 
+ import * as EventSink from "../orchestration-v2/EventSink.ts";
++import {
++  classifyClaudeNativeTool,
++  claudeNativeToolInputFromUnknown,
++  claudeToolTurnItem,
++  claudeTranscriptToolOutput,
++} from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
++import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
+ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+ import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+ import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
++import * as ServerConfig from "../config.ts";
++import {
++  attachmentRelativePath,
++  chatAttachmentStableKey,
++  createDeterministicAttachmentId,
++} from "../attachmentStore.ts";
+ import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+ import * as ProjectService from "./ProjectService.ts";
+ 
+@@ -82,14 +104,37 @@ class AgentSessionThreadModifiedError extends Schema.TaggedError<AgentSessionThr
+   }
+ }
+ 
++class AgentSessionAttachmentError extends Schema.TaggedError<AgentSessionAttachmentError>()(
++  "AgentSessionAttachmentError",
++  { message: Schema.String, cause: Schema.optional(Schema.Defect()) },
++) {}
++
+ function dateTime(value: string): DateTime.Utc {
+   return DateTime.makeUnsafe(value);
+ }
+ 
++function importedToolInput(value: unknown): string {
++  if (typeof value === "string") return value;
++  try {
++    return JSON.stringify(value) ?? "{}";
++  } catch {
++    return "{}";
++  }
++}
++
++function importedToolIsCommand(name: string): boolean {
++  const normalized = name.toLowerCase();
++  return normalized === "bash" || normalized.includes("shell") || normalized.includes("command");
++}
++
+ function messageEvents(input: {
+   readonly threadId: ThreadId;
+   readonly index: number;
+   readonly message: AgentSessionScanner.AgentSessionThreadMessage;
++  readonly attachments: ReadonlyArray<ChatAttachment>;
++  readonly providerThreadId: ProviderThreadId;
++  readonly driver: ProviderDriverKind;
++  readonly providerInstanceId: ProviderInstanceId;
+ }): ReadonlyArray<OrchestrationV2DomainEvent> {
+   const ordinal = input.index + 1;
+   const suffix = String(input.index).padStart(6, "0");
+@@ -97,17 +142,25 @@ function messageEvents(input: {
+   const turnItemId = TurnItemId.make(
+     `${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`,
+   );
++  const nodeId = NodeId.make(`${input.threadId}:import-node:${suffix}`);
++  const providerTurnId = ProviderTurnId.make(`${input.providerThreadId}:import-turn:${suffix}`);
+   const at = dateTime(input.message.createdAt);
++  const nativeId = input.message.sourceId ?? `${input.threadId}:message:${suffix}`;
++  const nativeRef = {
++    driver: input.driver,
++    nativeId,
++    strength: "weak" as const,
++  };
+   const message: OrchestrationV2ConversationMessage = {
+     createdBy: input.message.role === "user" ? "user" : "agent",
+     creationSource: "server",
+     id: messageId,
+     threadId: input.threadId,
+     runId: null,
+-    nodeId: null,
++    nodeId,
+     role: input.message.role,
+     text: input.message.text,
+-    attachments: [],
++    attachments: input.attachments,
+     streaming: false,
+     createdAt: at,
+     updatedAt: at,
+@@ -116,10 +169,10 @@ function messageEvents(input: {
+     id: turnItemId,
+     threadId: input.threadId,
+     runId: null,
+-    nodeId: null,
+-    providerThreadId: null,
+-    providerTurnId: null,
+-    nativeItemRef: null,
++    nodeId,
++    providerThreadId: input.providerThreadId,
++    providerTurnId,
++    nativeItemRef: nativeRef,
+     parentItemId: null,
+     ordinal,
+     status: "completed" as const,
+@@ -138,16 +191,59 @@ function messageEvents(input: {
+           messageId,
+           inputIntent: "turn_start",
+           text: input.message.text,
+-          attachments: [],
++          attachments: input.attachments,
+         }
+       : {
+           ...common,
+           type: "assistant_message",
+           messageId,
+           text: input.message.text,
++          ...(input.attachments.length === 0 ? {} : { attachments: input.attachments }),
+           streaming: false,
+         };
+-  return [
++  const events: Array<OrchestrationV2DomainEvent> = [
++    {
++      id: EventId.make(`${IMPORT_EVENT_PREFIX}:node:${input.threadId}:${suffix}`),
++      type: "node.updated",
++      threadId: input.threadId,
++      driver: input.driver,
++      occurredAt: at,
++      payload: {
++        id: nodeId,
++        threadId: input.threadId,
++        runId: null,
++        parentNodeId: null,
++        rootNodeId: nodeId,
++        kind: input.message.role === "user" ? "root_turn" : "assistant_message",
++        status: "completed",
++        countsForRun: false,
++        providerThreadId: input.providerThreadId,
++        providerTurnId,
++        nativeItemRef: nativeRef,
++        runtimeRequestId: null,
++        checkpointScopeId: null,
++        startedAt: at,
++        completedAt: at,
++      },
++    },
++    {
++      id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-turn:${input.threadId}:${suffix}`),
++      type: "provider-turn.updated",
++      threadId: input.threadId,
++      driver: input.driver,
++      occurredAt: at,
++      payload: {
++        id: providerTurnId,
++        providerThreadId: input.providerThreadId,
++        nodeId,
++        runAttemptId: null,
++        nativeTurnRef: nativeRef,
++        ordinal,
++        status: "completed",
++        startedAt: at,
++        completedAt: at,
++      },
++    },
+     {
+       id: EventId.make(`${IMPORT_EVENT_PREFIX}:message:${input.threadId}:${suffix}`),
+       type: "message.updated",
+@@ -163,6 +259,223 @@ function messageEvents(input: {
+       payload: turnItem,
+     },
+   ];
++  for (const [subagentIndex, activity] of (input.message.subagents ?? []).entries()) {
++    const subagentNodeId = NodeId.make(
++      `${input.threadId}:import-subagent:${suffix}:${subagentIndex}`,
++    );
++    const subagentAt = dateTime(activity.createdAt);
++    const subagentCompletedAt = dateTime(activity.completedAt);
++    const subagentRef = {
++      driver: input.driver,
++      nativeId: activity.id,
++      strength: "strong" as const,
++    };
++    const subagent = {
++      id: subagentNodeId,
++      threadId: input.threadId,
++      runId: null,
++      parentNodeId: nodeId,
++      origin: "provider_native" as const,
++      createdBy: "agent" as const,
++      driver: input.driver,
++      providerInstanceId: input.providerInstanceId,
++      providerThreadId: input.providerThreadId,
++      childThreadId: null,
++      nativeTaskRef: subagentRef,
++      prompt: activity.prompt,
++      title: activity.title,
++      model: null,
++      status: activity.status,
++      result: activity.result,
++      startedAt: subagentAt,
++      completedAt: subagentCompletedAt,
++      updatedAt: subagentCompletedAt,
++    };
++    events.push(
++      {
++        id: EventId.make(
++          `${IMPORT_EVENT_PREFIX}:subagent-node:${input.threadId}:${suffix}:${subagentIndex}`,
++        ),
++        type: "node.updated",
++        threadId: input.threadId,
++        driver: input.driver,
++        occurredAt: subagentCompletedAt,
++        payload: {
++          id: subagentNodeId,
++          threadId: input.threadId,
++          runId: null,
++          parentNodeId: nodeId,
++          rootNodeId: nodeId,
++          kind: "subagent",
++          status: activity.status,
++          countsForRun: false,
++          providerThreadId: input.providerThreadId,
++          providerTurnId,
++          nativeItemRef: subagentRef,
++          runtimeRequestId: null,
++          checkpointScopeId: null,
++          startedAt: subagentAt,
++          completedAt: subagentCompletedAt,
++        },
++      },
++      {
++        id: EventId.make(
++          `${IMPORT_EVENT_PREFIX}:subagent:${input.threadId}:${suffix}:${subagentIndex}`,
++        ),
++        type: "subagent.updated",
++        threadId: input.threadId,
++        driver: input.driver,
++        occurredAt: subagentCompletedAt,
++        payload: subagent,
++      },
++      {
++        id: EventId.make(
++          `${IMPORT_EVENT_PREFIX}:subagent-item:${input.threadId}:${suffix}:${subagentIndex}`,
++        ),
++        type: "turn-item.updated",
++        threadId: input.threadId,
++        driver: input.driver,
++        occurredAt: subagentCompletedAt,
++        payload: {
++          ...common,
++          id: TurnItemId.make(
++            `${IMPORT_EVENT_PREFIX}:subagent-item:${input.threadId}:${suffix}:${subagentIndex}`,
++          ),
++          nodeId: subagentNodeId,
++          parentItemId: turnItemId,
++          ordinal: ordinal + subagentIndex + 1,
++          updatedAt: subagentCompletedAt,
++          startedAt: subagentAt,
++          completedAt: subagentCompletedAt,
++          type: "subagent",
++          subagentId: subagentNodeId,
++          origin: "provider_native",
++          driver: input.driver,
++          providerInstanceId: input.providerInstanceId,
++          childThreadId: null,
++          prompt: activity.prompt,
++          result: activity.result,
++        },
++      },
++    );
++  }
++  const subagentCount = input.message.subagents?.length ?? 0;
++  for (const [activityIndex, activity] of (input.message.activities ?? []).entries()) {
++    const activityNodeId = NodeId.make(
++      `${input.threadId}:import-activity:${suffix}:${activityIndex}`,
++    );
++    const activityAt = dateTime(activity.createdAt);
++    const activityCompletedAt = dateTime(
++      activity.kind === "tool" ? activity.completedAt : activity.createdAt,
++    );
++    const activityRef = {
++      driver: input.driver,
++      nativeId:
++        activity.kind === "tool" ? activity.id : `${nativeId}:${activity.kind}:${activityIndex}`,
++      strength: "weak" as const,
++    };
++    const activityOrdinal = ordinal + subagentCount + activityIndex + 1;
++    const activityCommon = {
++      ...common,
++      id: TurnItemId.make(
++        `${IMPORT_EVENT_PREFIX}:activity-item:${input.threadId}:${suffix}:${activityIndex}`,
++      ),
++      nodeId: activityNodeId,
++      parentItemId: turnItemId,
++      ordinal: activityOrdinal,
++      nativeItemRef: activityRef,
++      startedAt: activityAt,
++      completedAt: activityCompletedAt,
++      updatedAt: activityCompletedAt,
++    };
++    const activityStatus =
++      activity.kind === "tool" && activity.failed ? ("failed" as const) : ("completed" as const);
++    const activityItemEvent = (activityItem: OrchestrationV2TurnItem) => ({
++      id: EventId.make(
++        `${IMPORT_EVENT_PREFIX}:activity-item-event:${input.threadId}:${suffix}:${activityIndex}`,
++      ),
++      type: "turn-item.updated" as const,
++      threadId: input.threadId,
++      driver: input.driver,
++      occurredAt: activityCompletedAt,
++      payload: activityItem,
++    });
++    if (activity.kind === "compaction") {
++      // Live Claude compactions belong to their turn's node rather than a node of their own.
++      events.push(
++        activityItemEvent({
++          ...activityCommon,
++          nodeId,
++          type: "compaction",
++          driver: input.driver,
++          title: "Context compacted",
++        }),
++      );
++      continue;
++    }
++    const activityItem: OrchestrationV2TurnItem =
++      activity.kind === "reasoning"
++        ? { ...activityCommon, type: "reasoning", text: activity.text, streaming: false }
++        : activity.claudeResult !== undefined
++          ? claudeToolTurnItem({
++              base: { ...activityCommon, status: activityStatus },
++              classification: classifyClaudeNativeTool(activity.name),
++              toolName: activity.name,
++              toolInput: claudeNativeToolInputFromUnknown(activity.input),
++              output: claudeTranscriptToolOutput(
++                activity.claudeResult.content,
++                activity.claudeResult.structuredOutput,
++              ),
++              presentation: mcpToolPresentation({
++                toolName: activity.name.replace(/^mcp__claude_ai_/u, "mcp__"),
++              }),
++            })
++          : importedToolIsCommand(activity.name)
++            ? {
++                ...activityCommon,
++                type: "command_execution",
++                input: importedToolInput(activity.input),
++                ...(activity.output === null ? {} : { output: activity.output }),
++                ...(activity.failed ? { outputIndicatesFailure: true } : {}),
++              }
++            : {
++                ...activityCommon,
++                type: "dynamic_tool",
++                toolName: activity.name,
++                input: activity.input,
++                ...(activity.output === null ? {} : { output: activity.output }),
++              };
++    events.push(
++      {
++        id: EventId.make(
++          `${IMPORT_EVENT_PREFIX}:activity-node:${input.threadId}:${suffix}:${activityIndex}`,
++        ),
++        type: "node.updated",
++        threadId: input.threadId,
++        driver: input.driver,
++        occurredAt: activityCompletedAt,
++        payload: {
++          id: activityNodeId,
++          threadId: input.threadId,
++          runId: null,
++          parentNodeId: nodeId,
++          rootNodeId: nodeId,
++          kind: activity.kind === "reasoning" ? "reasoning" : "tool_call",
++          status: activityStatus,
++          countsForRun: false,
++          providerThreadId: input.providerThreadId,
++          providerTurnId,
++          nativeItemRef: activityRef,
++          runtimeRequestId: null,
++          checkpointScopeId: null,
++          startedAt: activityAt,
++          completedAt: activityCompletedAt,
++        },
++      },
++      activityItemEvent(activityItem),
++    );
++  }
++  return events;
+ }
+ 
+ const make = Effect.gen(function* () {
+@@ -172,6 +485,66 @@ const make = Effect.gen(function* () {
+   const eventSink = yield* EventSink.EventSinkV2;
+   const idAllocator = yield* IdAllocator.IdAllocatorV2;
+   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
++  const persistImportedMessageAttachments = Effect.fn(
++    "AgentSessionImporter.persistImportedMessageAttachments",
++  )(function* (input: {
++    readonly threadId: ThreadId;
++    readonly messageId: MessageId;
++    readonly images: ReadonlyArray<AgentSessionScanner.AgentSessionImageAttachment>;
++  }) {
++    if (input.images.length === 0) return [];
++    const config = yield* ServerConfig.ServerConfig;
++    const fileSystem = yield* FileSystem.FileSystem;
++    const path = yield* Path.Path;
++    return yield* Effect.forEach(
++      input.images.map((image, index) => ({ image, index })),
++      ({ image, index }) =>
++        Effect.gen(function* () {
++          const separator = image.dataUrl.indexOf(",");
++          const encoded = separator < 0 ? "" : image.dataUrl.slice(separator + 1);
++          const bytes = yield* Effect.fromResult(Base64.decode(encoded)).pipe(
++            Effect.mapError(
++              (cause) =>
++                new AgentSessionAttachmentError({
++                  message: "Imported image is not valid base64.",
++                  cause,
++                }),
++            ),
++          );
++          if (bytes.byteLength !== image.sizeBytes) {
++            return yield* new AgentSessionAttachmentError({
++              message: "Imported image size does not match its payload.",
++            });
++          }
++          const rawId = createDeterministicAttachmentId(
++            input.threadId,
++            chatAttachmentStableKey(input.messageId, index, bytes),
++          );
++          if (rawId === null) {
++            return yield* new AgentSessionAttachmentError({
++              message: "Could not allocate an imported attachment ID.",
++            });
++          }
++          const attachment: ChatAttachment = {
++            type: "image",
++            id: ChatAttachmentId.make(rawId),
++            name: image.name,
++            mimeType: image.mimeType,
++            sizeBytes: image.sizeBytes,
++          };
++          const relativePath = attachmentRelativePath(attachment);
++          if (relativePath === null) {
++            return yield* new AgentSessionAttachmentError({
++              message: "Could not resolve imported attachment path.",
++            });
++          }
++          yield* fileSystem.writeFile(path.join(config.attachmentsDir, relativePath), bytes);
++          return attachment;
++        }),
++      { concurrency: 2 },
++    );
++  });
++
+   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
+     input: AgentSessionImportInput,
+   ) {
+@@ -211,7 +584,10 @@ const make = Effect.gen(function* () {
+       }
+       return payload.value.importedTranscripts ?? [];
+     });
+-    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
++    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources, {
++      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
++      ...(input.includeOlder === undefined ? {} : { includeOlder: input.includeOlder }),
++    });
+     const importedThreadIds = new Set<ThreadId>();
+     let importedCount = 0;
+     let skippedCount = 0;
+@@ -276,7 +652,10 @@ const make = Effect.gen(function* () {
+                 actualProjectId: existing.value.thread.projectId,
+               });
+             }
+-            if (existing.value.thread.historyOrigin !== "v1_import") {
++            if (
++              existing.value.thread.historyOrigin !== "v1_import" &&
++              existing.value.thread.historyOrigin !== "native"
++            ) {
+               return yield* new AgentSessionThreadModifiedError({ threadId });
+             }
+             yield* persistRuntime;
+@@ -307,7 +686,7 @@ const make = Effect.gen(function* () {
+             linkedPullRequest: null,
+             branchPullRequest: null,
+             activeProviderThreadId: providerThreadId,
+-            historyOrigin: "v1_import",
++            historyOrigin: "native",
+             lineage: {
+               parentThreadId: null,
+               relationshipToParent: null,
+@@ -362,9 +741,6 @@ const make = Effect.gen(function* () {
+                 occurredAt: createdAt,
+                 payload: appThread,
+               },
+-              ...thread.messages.flatMap((message, index) =>
+-                messageEvents({ threadId, index, message }),
+-              ),
+               {
+                 id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
+                 type: "provider-thread.updated",
+@@ -374,6 +750,23 @@ const make = Effect.gen(function* () {
+                 occurredAt: updatedAt,
+                 payload: providerThread,
+               },
++              ...(yield* Effect.forEach(thread.messages, (message, index) =>
++                persistImportedMessageAttachments({
++                  threadId,
++                  messageId: MessageId.make(`${threadId}:${String(index).padStart(6, "0")}`),
++                  images: message.images ?? [],
++                }),
++              )).flatMap((attachments, index) =>
++                messageEvents({
++                  threadId,
++                  index,
++                  message: thread.messages[index]!,
++                  attachments,
++                  providerThreadId,
++                  driver,
++                  providerInstanceId: thread.providerInstanceId,
++                }),
++              ),
+             ],
+           });
+           if (committed.length === 0) return null;
+diff --git a/apps/server/src/project/AgentSessionScanner.test.ts b/apps/server/src/project/AgentSessionScanner.test.ts
+index baf0f27f9e..301130c9f6 100644
+--- a/apps/server/src/project/AgentSessionScanner.test.ts
++++ b/apps/server/src/project/AgentSessionScanner.test.ts
+@@ -1500,12 +1500,184 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
+               { role: "user", text: "First prompt" },
+               { role: "assistant", text: "First reply" },
+               { role: "user", text: "Latest prompt" },
++              {
++                role: "assistant",
++                text: "",
++                activities: [expect.objectContaining({ kind: "tool", name: "Bash", output: "ok" })],
++              },
+             ],
+           },
+         ]);
+       }),
+     );
+ 
++    it.effect("imports explicitly selected Claude history larger than the old memory budget", () =>
++      Effect.gen(function* () {
++        const path = yield* Path.Path;
++        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
++        yield* TestClock.setTime(nowMs);
++        const claudeHomePath = yield* makeTempDir("t3code-selected-claude-");
++        const codexHomePath = yield* makeTempDir("t3code-selected-codex-");
++        const workspace = yield* makeTempDir("t3code-selected-workspace-");
++        const text = "x".repeat(65 * 1024 * 1024);
++        yield* writeTranscript({
++          filePath: path.join(claudeHomePath, "projects", "-slug", "large-session.jsonl"),
++          contents: [
++            encodeTranscriptRecord({
++              type: "user",
++              cwd: workspace,
++              sessionId: "large-session",
++              message: { role: "user", content: "Keep the full conversation" },
++            }),
++            encodeTranscriptRecord({
++              type: "assistant",
++              sessionId: "large-session",
++              message: { role: "assistant", content: text },
++            }),
++          ].join("\n"),
++          mtimeMs: nowMs,
++        });
++        const outcomes = yield* Effect.gen(function* () {
++          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
++          return yield* scanner
++            .recentThreads(workspace, [], { sessionId: "large-session" })
++            .pipe(Stream.runCollect);
++        }).pipe(Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })));
++        expect(outcomes[0]?._tag).toBe("Importable");
++        if (outcomes[0]?._tag === "Importable") {
++          expect(outcomes[0].thread.messages[1]?.text.length).toBe(text.length);
++        }
++      }),
++    );
++
++    it.effect("follows the current Claude branch through records it does not retain", () =>
++      Effect.gen(function* () {
++        const path = yield* Path.Path;
++        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
++        yield* TestClock.setTime(nowMs);
++        const claudeHomePath = yield* makeTempDir("t3code-branch-claude-");
++        const codexHomePath = yield* makeTempDir("t3code-branch-codex-");
++        const workspace = yield* makeTempDir("t3code-branch-workspace-");
++        const record = (uuid: string, parentUuid: string | null, fields: Record<string, unknown>) =>
++          encodeTranscriptRecord({
++            sessionId: "branched",
++            cwd: workspace,
++            uuid,
++            parentUuid,
++            ...fields,
++          });
++        const user = (text: string) => ({ type: "user", message: { role: "user", content: text } });
++        const assistant = (text: string) => ({
++          type: "assistant",
++          message: { role: "assistant", content: [{ type: "text", text }] },
++        });
++        yield* writeTranscript({
++          filePath: path.join(claudeHomePath, "projects", "-slug", "branched.jsonl"),
++          contents: [
++            record("u1", null, user("First prompt")),
++            record("a1", "u1", assistant("First reply")),
++            // Real sessions chain prompts through bookkeeping records the importer drops.
++            record("s1", "a1", { type: "system", subtype: "turn_duration" }),
++            record("att1", "s1", { type: "attachment" }),
++            record("u2", "att1", user("Abandoned prompt")),
++            record("a2", "u2", assistant("Abandoned reply")),
++            record("u3", "att1", user("Edited prompt")),
++            record("a3", "u3", assistant("Edited reply")),
++            // Claude marks the submitted prompt, not the reply that follows it.
++            encodeTranscriptRecord({ type: "last-prompt", sessionId: "branched", leafUuid: "u3" }),
++          ].join("\n"),
++          mtimeMs: nowMs,
++        });
++
++        const threads = yield* runRecentThreads({
++          claudeHomePath,
++          codexHomePath,
++          workspaceRoot: workspace,
++        });
++
++        expect(threads[0]?.messages.map((message) => message.text)).toEqual([
++          "First prompt",
++          "First reply",
++          "Edited prompt",
++          "Edited reply",
++        ]);
++      }),
++    );
++
++    it.effect("keeps Claude history across compaction and marks the boundary", () =>
++      Effect.gen(function* () {
++        const path = yield* Path.Path;
++        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
++        yield* TestClock.setTime(nowMs);
++        const claudeHomePath = yield* makeTempDir("t3code-compact-claude-");
++        const codexHomePath = yield* makeTempDir("t3code-compact-codex-");
++        const workspace = yield* makeTempDir("t3code-compact-workspace-");
++        const record = (uuid: string, parentUuid: string | null, fields: Record<string, unknown>) =>
++          encodeTranscriptRecord({
++            sessionId: "compacted",
++            cwd: workspace,
++            uuid,
++            parentUuid,
++            ...fields,
++          });
++        yield* writeTranscript({
++          filePath: path.join(claudeHomePath, "projects", "-slug", "compacted.jsonl"),
++          contents: [
++            record("u1", null, {
++              type: "user",
++              timestamp: "2026-08-24T10:00:00.000Z",
++              message: { role: "user", content: "Before compaction" },
++            }),
++            record("a1", "u1", {
++              type: "assistant",
++              timestamp: "2026-08-24T10:01:00.000Z",
++              message: { role: "assistant", content: [{ type: "text", text: "Early reply" }] },
++            }),
++            // A compact boundary starts a new physical root and names its real parent logically.
++            record("c1", null, {
++              type: "system",
++              subtype: "compact_boundary",
++              logicalParentUuid: "a1",
++              timestamp: "2026-08-24T10:02:00.000Z",
++            }),
++            record("summary", "c1", {
++              type: "user",
++              isCompactSummary: true,
++              timestamp: "2026-08-24T10:02:00.000Z",
++              message: { role: "user", content: "Summary of the earlier conversation" },
++            }),
++            record("u2", "summary", {
++              type: "user",
++              timestamp: "2026-08-24T10:03:00.000Z",
++              message: { role: "user", content: "After compaction" },
++            }),
++            record("a2", "u2", {
++              type: "assistant",
++              timestamp: "2026-08-24T10:04:00.000Z",
++              message: { role: "assistant", content: [{ type: "text", text: "Late reply" }] },
++            }),
++          ].join("\n"),
++          mtimeMs: nowMs,
++        });
++
++        const threads = yield* runRecentThreads({
++          claudeHomePath,
++          codexHomePath,
++          workspaceRoot: workspace,
++        });
++
++        expect(threads[0]?.messages).toMatchObject([
++          { text: "Before compaction" },
++          { text: "Early reply" },
++          {
++            text: "After compaction",
++            activities: [{ kind: "compaction", createdAt: "2026-08-24T10:02:00.000Z" }],
++          },
++          { text: "Late reply" },
++        ]);
++      }),
++    );
++
+     it.effect("skips growth during reading without exceeding the reserved bytes", () =>
+       Effect.gen(function* () {
+         const path = yield* Path.Path;
+@@ -1705,6 +1877,88 @@ describe("parseAgentSessionTranscript", () => {
+     });
+   });
+ 
++  it("retains Claude inline images and native Agent tasks on the selected leaf", () => {
++    const thread = AgentSessionScanner.parseAgentSessionTranscript({
++      contents: [
++        JSON.stringify({
++          type: "user",
++          uuid: "user-1",
++          sessionId: "claude-session",
++          message: { role: "user", content: "Investigate this" },
++        }),
++        JSON.stringify({
++          type: "assistant",
++          uuid: "assistant-1",
++          parentUuid: "user-1",
++          sessionId: "claude-session",
++          message: {
++            role: "assistant",
++            content: [
++              { type: "thinking", thinking: "I will delegate the research." },
++              {
++                type: "tool_use",
++                id: "tool-1",
++                name: "Agent",
++                input: { description: "Research", prompt: "Research the issue" },
++              },
++            ],
++          },
++        }),
++        JSON.stringify({
++          type: "user",
++          uuid: "tool-result-1",
++          parentUuid: "assistant-1",
++          sessionId: "claude-session",
++          message: {
++            role: "user",
++            content: [{ type: "tool_result", tool_use_id: "tool-1", content: "Research complete" }],
++          },
++        }),
++        JSON.stringify({
++          type: "assistant",
++          uuid: "assistant-2",
++          parentUuid: "tool-result-1",
++          sessionId: "claude-session",
++          message: {
++            role: "assistant",
++            content: [{ type: "text", text: "Here is the result" }],
++          },
++        }),
++        JSON.stringify({
++          type: "user",
++          uuid: "user-2",
++          sessionId: "claude-session",
++          parentUuid: "assistant-2",
++          message: {
++            role: "user",
++            content: [
++              {
++                type: "image",
++                source: { type: "base64", media_type: "image/png", data: "aGk=" },
++              },
++            ],
++          },
++        }),
++        JSON.stringify({ type: "last-prompt", sessionId: "claude-session", leafUuid: "user-2" }),
++      ].join("\n"),
++      source: "claudeAgent",
++      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
++      fallbackSessionId: "fallback",
++      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
++      maxMessages: 10_000,
++    });
++
++    expect(thread?.messages.find((message) => message.subagents)?.subagents).toEqual([
++      expect.objectContaining({ id: "tool-1", status: "completed", result: "Research complete" }),
++    ]);
++    expect(thread?.messages.find((message) => message.activities)?.activities).toEqual(
++      expect.arrayContaining([expect.objectContaining({ kind: "reasoning" })]),
++    );
++    expect(thread?.messages.find((message) => message.images)?.images).toEqual([
++      expect.objectContaining({ mimeType: "image/png", sizeBytes: 2 }),
++    ]);
++  });
++
+   it.each([
+     { customTitles: ["Refactor auth module"], expected: "Refactor auth module" },
+     // Claude writes an empty customTitle when the user clears a rename.
+@@ -1791,6 +2045,56 @@ describe("parseAgentSessionTranscript", () => {
+     ]);
+   });
+ 
++  it("retains Codex custom tool calls as native tool activity", () => {
++    const thread = AgentSessionScanner.parseAgentSessionTranscript({
++      contents: [
++        JSON.stringify({ type: "session_meta", payload: { id: "codex-session" } }),
++        JSON.stringify({
++          type: "event_msg",
++          timestamp: "2026-08-24T10:00:00.000Z",
++          payload: { type: "user_message", message: "Inspect the project" },
++        }),
++        JSON.stringify({
++          type: "response_item",
++          timestamp: "2026-08-24T10:00:01.000Z",
++          payload: {
++            type: "custom_tool_call",
++            call_id: "call-1",
++            name: "exec",
++            input: '{"cmd":"pwd"}',
++          },
++        }),
++        JSON.stringify({
++          type: "response_item",
++          timestamp: "2026-08-24T10:00:02.000Z",
++          payload: {
++            type: "custom_tool_call_output",
++            call_id: "call-1",
++            output: [{ type: "input_text", text: "/workspace/project" }],
++            status: "completed",
++          },
++        }),
++        JSON.stringify({
++          type: "response_item",
++          timestamp: "2026-08-24T10:00:03.000Z",
++          payload: {
++            type: "message",
++            role: "assistant",
++            content: [{ type: "output_text", text: "The project is ready." }],
++          },
++        }),
++      ].join("\n"),
++      source: "codex",
++      providerInstanceId: ProviderInstanceId.make("codex"),
++      fallbackSessionId: "codex-session",
++      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
++    });
++
++    expect(thread?.messages.find((message) => message.activities)?.activities).toEqual([
++      expect.objectContaining({ kind: "tool", name: "exec", output: "/workspace/project" }),
++    ]);
++  });
++
+   it("keeps the canonical first prompt after long Codex transcripts are capped", () => {
+     const canonicalPrompt = "\n  Keep the canonical prompt  \n";
+     const canonicalTimestamp = "2026-08-24T10:01:00.000Z";
+diff --git a/apps/server/src/project/AgentSessionScanner.ts b/apps/server/src/project/AgentSessionScanner.ts
+index 9c26b187a5..c8c722e965 100644
+--- a/apps/server/src/project/AgentSessionScanner.ts
++++ b/apps/server/src/project/AgentSessionScanner.ts
+@@ -57,13 +57,33 @@ const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+ const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
+ const MAX_IMPORTED_MESSAGES = 200;
+ const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
++// A single selected session can include years of tools and inline images.
++// Keep bulk imports smaller and serialize reads through importReadLock below.
++const MAX_SELECTED_IMPORT_HISTORY_BYTES = 512 * 1024 * 1024;
++const MAX_SELECTED_IMPORTED_MESSAGES = 100_000;
+ const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
+ const MAX_IMPORT_TRANSCRIPTS = 100;
+ const MAX_IMPORT_RECORDS = 100_000;
++const MAX_SELECTED_IMPORT_RECORDS = 1_000_000;
+ 
+ const TranscriptContentBlock = Schema.Struct({
+   type: Schema.optional(Schema.String),
+   text: Schema.optional(Schema.String),
++  thinking: Schema.optional(Schema.String),
++  id: Schema.optional(Schema.String),
++  name: Schema.optional(Schema.String),
++  input: Schema.optional(Schema.Unknown),
++  content: Schema.optional(Schema.Unknown),
++  tool_use_id: Schema.optional(Schema.String),
++  is_error: Schema.optional(Schema.Boolean),
++  source: Schema.optional(
++    Schema.Struct({
++      type: Schema.optional(Schema.String),
++      media_type: Schema.optional(Schema.String),
++      data: Schema.optional(Schema.String),
++      url: Schema.optional(Schema.String),
++    }),
++  ),
+ });
+ 
+ const TranscriptMessage = Schema.Struct({
+@@ -78,11 +98,17 @@ const CodexTurnMetadata = Schema.Struct({
+ 
+ const TranscriptRecord = Schema.Struct({
+   type: Schema.optional(Schema.String),
++  subtype: Schema.optional(Schema.String),
+   timestamp: Schema.optional(Schema.String),
+   cwd: Schema.optional(Schema.String),
+   sessionId: Schema.optional(Schema.String),
++  uuid: Schema.optional(Schema.String),
++  toolUseResult: Schema.optional(Schema.Unknown),
++  parentUuid: Schema.optional(Schema.NullOr(Schema.String)),
++  logicalParentUuid: Schema.optional(Schema.NullOr(Schema.String)),
+   aiTitle: Schema.optional(Schema.String),
+   customTitle: Schema.optional(Schema.String),
++  leafUuid: Schema.optional(Schema.String),
+   isSidechain: Schema.optional(Schema.Boolean),
+   isMeta: Schema.optional(Schema.Boolean),
+   isCompactSummary: Schema.optional(Schema.Boolean),
+@@ -90,9 +116,14 @@ const TranscriptRecord = Schema.Struct({
+   payload: Schema.optional(
+     Schema.Struct({
+       id: Schema.optional(Schema.String),
++      call_id: Schema.optional(Schema.String),
+       session_id: Schema.optional(Schema.String),
+       type: Schema.optional(Schema.String),
+       role: Schema.optional(Schema.String),
++      name: Schema.optional(Schema.String),
++      input: Schema.optional(Schema.Unknown),
++      output: Schema.optional(Schema.Unknown),
++      status: Schema.optional(Schema.String),
+       message: Schema.optional(Schema.String),
+       model: Schema.optional(Schema.String),
+       cwd: Schema.optional(Schema.String),
+@@ -116,14 +147,59 @@ interface AgentSessionTranscriptMetadata {
+   readonly providerInstanceId: ProviderInstanceId;
+   readonly fallbackSessionId: string;
+   readonly lastActiveAtMs: number;
++  readonly maxMessages?: number;
+ }
+ 
+ export interface AgentSessionThreadMessage {
+   readonly role: "user" | "assistant";
+   readonly text: string;
+   readonly createdAt: string;
++  readonly sourceId?: string;
++  readonly images?: ReadonlyArray<AgentSessionImageAttachment>;
++  readonly subagents?: ReadonlyArray<AgentSessionSubagentActivity>;
++  readonly activities?: ReadonlyArray<AgentSessionActivity>;
++}
++
++export interface AgentSessionImageAttachment {
++  readonly name: string;
++  readonly mimeType: string;
++  readonly sizeBytes: number;
++  readonly dataUrl: string;
++}
++
++export interface AgentSessionSubagentActivity {
++  readonly id: string;
++  readonly prompt: string;
++  readonly title: string;
++  readonly status: "completed" | "failed" | "interrupted";
++  readonly result: string | null;
++  readonly createdAt: string;
++  readonly completedAt: string;
+ }
+ 
++export type AgentSessionActivity =
++  | {
++      readonly kind: "reasoning";
++      readonly text: string;
++      readonly createdAt: string;
++    }
++  | {
++      readonly kind: "compaction";
++      readonly createdAt: string;
++    }
++  | {
++      readonly kind: "tool";
++      readonly id: string;
++      readonly name: string;
++      readonly input: unknown;
++      readonly output: string | null;
++      readonly failed: boolean;
++      readonly createdAt: string;
++      readonly completedAt: string;
++      // Claude's raw result, rendered through the live adapter's tool presentation.
++      readonly claudeResult?: { readonly content: unknown; readonly structuredOutput: unknown };
++    };
++
+ export interface AgentSessionThread {
+   readonly source: AgentSessionSource;
+   readonly providerInstanceId: ProviderInstanceId;
+@@ -152,6 +228,7 @@ export class AgentSessionScanner extends Context.Service<
+     readonly recentThreads: (
+       workspaceRoot: string,
+       completedSources?: ReadonlyArray<AgentSessionImportSource>,
++      options?: { readonly sessionId?: string; readonly includeOlder?: boolean },
+     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
+   }
+ >()("t3/project/AgentSessionScanner") {}
+@@ -225,6 +302,60 @@ function extractText(
+     .join("\n");
+ }
+ 
++function base64ByteLength(value: string): number {
++  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
++  return Math.max(0, Math.floor((value.length * 3) / 4) - padding);
++}
++
++function extractClaudeImages(
++  content: string | ReadonlyArray<typeof TranscriptContentBlock.Type> | undefined,
++): ReadonlyArray<AgentSessionImageAttachment> {
++  if (!Array.isArray(content)) return [];
++  return content.flatMap((block, index) => {
++    if (
++      block.type !== "image" ||
++      block.source?.type !== "base64" ||
++      block.source.data === undefined ||
++      block.source.data.trim().length === 0
++    )
++      return [];
++    const mimeType = block.source.media_type?.trim().toLowerCase() ?? "image/png";
++    if (!mimeType.startsWith("image/")) return [];
++    const data = block.source.data.trim();
++    return [
++      {
++        name: `image-${index + 1}`,
++        mimeType,
++        sizeBytes: base64ByteLength(data),
++        dataUrl: `data:${mimeType};base64,${data}`,
++      },
++    ];
++  });
++}
++
++function unknownRecord(value: unknown): Readonly<Record<string, unknown>> | null {
++  return typeof value === "object" && value !== null && !Array.isArray(value)
++    ? (value as Readonly<Record<string, unknown>>)
++    : null;
++}
++
++function textFromUnknown(value: unknown): string {
++  if (typeof value === "string") return value.trim();
++  if (!Array.isArray(value)) return "";
++  return value
++    .flatMap((entry) => {
++      const record = unknownRecord(entry);
++      return (record?.type === "text" ||
++        record?.type === "input_text" ||
++        record?.type === "output_text") &&
++        typeof record.text === "string"
++        ? [record.text.trim()]
++        : [];
++    })
++    .filter((text) => text.length > 0)
++    .join("\n");
++}
++
+ function normalizeTimestamp(value: string | undefined, fallback: string): string {
+   if (value === undefined) return fallback;
+   const parsed = DateTime.make(value);
+@@ -253,6 +384,7 @@ interface ClaudeFields {
+   readonly title: string | undefined;
+   readonly customTitle: string | null;
+   readonly model: string | undefined;
++  readonly currentLeafUuid: string | undefined;
+ }
+ 
+ const emptyClaudeFields: ClaudeFields = {
+@@ -260,6 +392,7 @@ const emptyClaudeFields: ClaudeFields = {
+   title: undefined,
+   customTitle: null,
+   model: undefined,
++  currentLeafUuid: undefined,
+ };
+ 
+ function foldClaudeFields(fields: ClaudeFields, record: DecodedTranscriptRecord): ClaudeFields {
+@@ -274,6 +407,10 @@ function foldClaudeFields(fields: ClaudeFields, record: DecodedTranscriptRecord)
+     // Claude uses this sentinel for local error responses. It is not a
+     // model ID that can be selected when the imported session resumes.
+     model: model && model !== "<synthetic>" ? model : fields.model,
++    currentLeafUuid:
++      record.type === "last-prompt"
++        ? record.leafUuid?.trim() || fields.currentLeafUuid
++        : fields.currentLeafUuid,
+   };
+ }
+ 
+@@ -295,18 +432,150 @@ export function parseAgentSessionTranscript(
+ ): AgentSessionThread | null {
+   if (lines.length > MAX_IMPORT_RECORDS) return null;
+   const records = lines.flatMap((line) => Option.toArray(decodeTranscriptRecord(line)));
+-  const claudeFields =
+-    input.source === "claudeAgent"
+-      ? records.reduce(foldClaudeFields, emptyClaudeFields)
+-      : emptyClaudeFields;
+-  return parseAgentSessionRecords(input, records, claudeFields);
++  if (input.source !== "claudeAgent") {
++    return parseAgentSessionRecords(input, records, emptyClaudeFields, []);
++  }
++  return parseAgentSessionRecords(
++    input,
++    records,
++    records.reduce(foldClaudeFields, emptyClaudeFields),
++    records.flatMap((record) => Option.toArray(claudeGraphNode(record))),
++  );
++}
++
++// Every main-chain record, including bookkeeping records the importer does not retain:
++// real sessions link prompts and replies through attachments, hooks, and turn timings.
++interface ClaudeGraphNode {
++  readonly uuid: string;
++  readonly parentUuid: string | undefined;
++  readonly logicalParentUuid: string | undefined;
++  readonly subtype: string | undefined;
++  readonly timestamp: string;
++  // Only a visible prompt or reply can end a conversation branch.
++  readonly endpoint: boolean;
++}
++
++function claudeGraphNode(record: DecodedTranscriptRecord): Option.Option<ClaudeGraphNode> {
++  if (!record.uuid || record.isSidechain === true) return Option.none();
++  const content = record.message?.content;
++  return Option.some({
++    uuid: record.uuid,
++    parentUuid: record.parentUuid || undefined,
++    logicalParentUuid: record.logicalParentUuid || undefined,
++    subtype: record.subtype,
++    timestamp: record.timestamp ?? "",
++    endpoint:
++      (record.type === "user" || record.type === "assistant") &&
++      !isHiddenClaudeRecord(record) &&
++      (extractText(content) !== "" ||
++        (record.type === "user" &&
++          Array.isArray(content) &&
++          content.some((block) => block.type === "image"))),
++  });
++}
++
++function currentClaudeLineage(
++  graph: ReadonlyArray<ClaudeGraphNode>,
++  currentLeafUuid: string | undefined,
++): ReadonlySet<string> | null {
++  const nodes = new Map(graph.map((node) => [node.uuid, node]));
++  const parentOf = (node: ClaudeGraphNode): ClaudeGraphNode | undefined => {
++    if (node.parentUuid) return nodes.get(node.parentUuid);
++    // A compact boundary starts a new physical root; its logical parent continues the branch.
++    if (node.subtype !== "compact_boundary" || !node.logicalParentUuid) return undefined;
++    const logical = nodes.get(node.logicalParentUuid);
++    return logical !== undefined && logical.timestamp <= node.timestamp ? logical : undefined;
++  };
++  const ancestry = (start: ClaudeGraphNode) => {
++    const chain: Array<ClaudeGraphNode> = [];
++    const seen = new Set<string>();
++    for (let node: ClaudeGraphNode | undefined = start; node && !seen.has(node.uuid);) {
++      seen.add(node.uuid);
++      chain.push(node);
++      node = parentOf(node);
++    }
++    return chain;
++  };
++  const nearestEndpoint = (start: ClaudeGraphNode) => ancestry(start).find((node) => node.endpoint);
++
++  const referenced = new Set<string>();
++  for (const node of nodes.values()) {
++    const parent = parentOf(node);
++    if (parent !== undefined) referenced.add(parent.uuid);
++  }
++  const endpoints = new Map<string, ClaudeGraphNode>();
++  for (const node of nodes.values()) {
++    if (referenced.has(node.uuid)) continue;
++    const endpoint = nearestEndpoint(node);
++    if (endpoint !== undefined) endpoints.set(endpoint.uuid, endpoint);
++  }
++  const covered = new Set<string>();
++  for (const endpoint of endpoints.values()) {
++    for (let node = parentOf(endpoint); node && !covered.has(node.uuid); node = parentOf(node)) {
++      covered.add(node.uuid);
++    }
++  }
++  const leaves = [...endpoints.values()].filter((endpoint) => !covered.has(endpoint.uuid));
++  if (leaves.length === 0) return null;
++  const latest = (candidates: ReadonlyArray<ClaudeGraphNode>) =>
++    candidates.reduce((best, node) => (node.timestamp >= best.timestamp ? node : best));
++  // Claude marks the submitted prompt; its reply, or a dead-end record after it, may follow.
++  const marked = currentLeafUuid === undefined ? undefined : nodes.get(currentLeafUuid);
++  const continuations =
++    marked === undefined
++      ? []
++      : leaves.filter((leaf) => ancestry(leaf).some((node) => node.uuid === marked.uuid));
++  const leaf =
++    continuations.length > 0
++      ? latest(continuations)
++      : ((marked && nearestEndpoint(marked)) ?? latest(leaves));
++  return new Set(ancestry(leaf).map((node) => node.uuid));
++}
++
++function currentClaudeBranch(
++  records: ReadonlyArray<DecodedTranscriptRecord>,
++  graph: ReadonlyArray<ClaudeGraphNode>,
++  currentLeafUuid: string | undefined,
++) {
++  const unbranched = { records, compactions: [], graphOrder: new Map<string, number>() };
++  const lineage = currentClaudeLineage(graph, currentLeafUuid);
++  if (lineage === null) return unbranched;
++  const branch = records.filter((record) => record.uuid === undefined || lineage.has(record.uuid));
++  if (
++    !branch.some((record) => record.type === "user" && extractText(record.message?.content) !== "")
++  ) {
++    return unbranched;
++  }
++  return {
++    records: branch,
++    compactions: graph.flatMap((node, order) =>
++      node.subtype === "compact_boundary" && lineage.has(node.uuid)
++        ? [{ order, timestamp: node.timestamp }]
++        : [],
++    ),
++    graphOrder: new Map(graph.map((node, order) => [node.uuid, order])),
++  };
+ }
+ 
+ function parseAgentSessionRecords(
+   input: AgentSessionTranscriptMetadata,
+   records: ReadonlyArray<DecodedTranscriptRecord>,
+   claudeFields: ClaudeFields,
++  claudeGraph: ReadonlyArray<ClaudeGraphNode>,
+ ): AgentSessionThread | null {
++  const maxMessages = input.maxMessages ?? MAX_IMPORTED_MESSAGES;
++  const claudeBranch =
++    input.source === "claudeAgent"
++      ? currentClaudeBranch(records, claudeGraph, claudeFields.currentLeafUuid)
++      : undefined;
++  const branchRecords = claudeBranch?.records ?? records;
++  const pendingCompactions = [...(claudeBranch?.compactions ?? [])];
++  const takeCompactionsBefore = (uuid: string | undefined) => {
++    const order = uuid === undefined ? undefined : claudeBranch?.graphOrder.get(uuid);
++    if (order === undefined) return [];
++    const count = pendingCompactions.findIndex((compaction) => compaction.order > order);
++    return pendingCompactions.splice(0, count === -1 ? pendingCompactions.length : count);
++  };
+   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
+   // Claude filenames are session IDs. Codex rollout filenames include extra
+   // timestamp text, so only transcript metadata can provide a resumable ID.
+@@ -383,7 +652,7 @@ function parseAgentSessionRecords(
+       derivedTitle = deriveTitle(input.source, message.text);
+     }
+     messages.push(message);
+-    if (messages.length > MAX_IMPORTED_MESSAGES) messages.shift();
++    if (messages.length > maxMessages) messages.shift();
+   };
+ 
+   const hasMatchingCodexEventInTurn = (text: string) => {
+@@ -402,23 +671,194 @@ function parseAgentSessionRecords(
+     return false;
+   };
+ 
++  const codexToolResults = new Map<
++    string,
++    { readonly text: string; readonly failed: boolean; readonly timestamp: string }
++  >();
++  if (input.source === "codex") {
++    for (const record of records) {
++      if (
++        record.type !== "response_item" ||
++        (record.payload?.type !== "custom_tool_call_output" &&
++          record.payload?.type !== "function_call_output")
++      )
++        continue;
++      const callId = record.payload.call_id ?? record.payload.id;
++      if (callId === undefined) continue;
++      codexToolResults.set(callId, {
++        text: textFromUnknown(record.payload.output),
++        failed: record.payload.status === "failed" || record.payload.status === "error",
++        timestamp: normalizeTimestamp(record.timestamp, fallbackTimestamp),
++      });
++    }
++  }
++
++  const claudeToolResults = new Map<
++    string,
++    {
++      readonly text: string;
++      readonly failed: boolean;
++      readonly timestamp: string;
++      readonly content: unknown;
++      readonly structuredOutput: unknown;
++    }
++  >();
++  if (input.source === "claudeAgent") {
++    for (const record of branchRecords) {
++      if (record.type !== "user") continue;
++      const results = (
++        Array.isArray(record.message?.content) ? record.message.content : []
++      ).flatMap((block) =>
++        block.type === "tool_result" && block.tool_use_id !== undefined
++          ? [{ id: block.tool_use_id, block }]
++          : [],
++      );
++      for (const { id, block } of results) {
++        claudeToolResults.set(id, {
++          text: textFromUnknown(block.content),
++          failed: block.is_error === true,
++          timestamp: normalizeTimestamp(record.timestamp, fallbackTimestamp),
++          content: block.content,
++          // Like the SDK, a record's structured result is unambiguous only beside one result.
++          structuredOutput: results.length === 1 ? record.toolUseResult : undefined,
++        });
++      }
++    }
++  }
++
+   let recordIndex = -1;
+-  for (const record of records) {
++  for (const record of branchRecords) {
+     recordIndex += 1;
+     if (input.source === "claudeAgent") {
+       if (isHiddenClaudeRecord(record)) continue;
+       if (record.type !== "user" && record.type !== "assistant") continue;
+       const text = extractText(record.message?.content);
+-      if (text.length === 0) continue;
++      const images = extractClaudeImages(record.message?.content);
++      const subagents =
++        record.type === "assistant"
++          ? (Array.isArray(record.message?.content)
++              ? record.message.content
++              : []
++            ).flatMap<AgentSessionSubagentActivity>((block) => {
++              if (block.type !== "tool_use" || block.id === undefined) return [];
++              const name = block.name?.trim() ?? "";
++              if (name.toLowerCase() !== "agent" && name.toLowerCase() !== "task") return [];
++              const toolInput = unknownRecord(block.input);
++              const prompt =
++                (typeof toolInput?.prompt === "string" && toolInput.prompt.trim()) ||
++                (typeof toolInput?.description === "string" && toolInput.description.trim()) ||
++                "Historical subagent task";
++              const result = claudeToolResults.get(block.id);
++              return [
++                {
++                  id: block.id,
++                  prompt,
++                  title:
++                    (typeof toolInput?.description === "string" && toolInput.description.trim()) ||
++                    "Subagent task",
++                  status: result?.failed
++                    ? ("failed" as const)
++                    : result
++                      ? ("completed" as const)
++                      : ("interrupted" as const),
++                  result: result?.text || null,
++                  createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
++                  completedAt:
++                    result?.timestamp ?? normalizeTimestamp(record.timestamp, fallbackTimestamp),
++                },
++              ];
++            })
++          : [];
++      const activities: ReadonlyArray<AgentSessionActivity> =
++        record.type === "assistant"
++          ? (Array.isArray(record.message?.content)
++              ? record.message.content
++              : []
++            ).flatMap<AgentSessionActivity>((block) => {
++              if (block.type === "thinking" && block.thinking?.trim()) {
++                return [
++                  {
++                    kind: "reasoning" as const,
++                    text: block.thinking.trim(),
++                    createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
++                  },
++                ];
++              }
++              if (block.type !== "tool_use" || block.id === undefined) return [];
++              const result = claudeToolResults.get(block.id);
++              return [
++                {
++                  kind: "tool" as const,
++                  id: block.id,
++                  name: block.name?.trim() || "Tool",
++                  input: block.input ?? {},
++                  output: result?.text || null,
++                  failed: result?.failed === true,
++                  createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
++                  completedAt:
++                    result?.timestamp ?? normalizeTimestamp(record.timestamp, fallbackTimestamp),
++                  claudeResult: {
++                    content: result?.content,
++                    structuredOutput: result?.structuredOutput,
++                  },
++                },
++              ];
++            })
++          : [];
++      const hasMessage =
++        text.length > 0 || images.length > 0 || subagents.length > 0 || activities.length > 0;
++      const compactions: ReadonlyArray<AgentSessionActivity> = hasMessage
++        ? takeCompactionsBefore(record.uuid).map((compaction) => ({
++            kind: "compaction",
++            createdAt: normalizeTimestamp(compaction.timestamp, fallbackTimestamp),
++          }))
++        : [];
++      if (!hasMessage) continue;
++      const messageActivities = [...compactions, ...activities];
+       retainMessage({
+         role: record.type,
+         text,
+         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
++        ...(record.uuid === undefined ? {} : { sourceId: record.uuid }),
+         codexResponseUser: false,
++        ...(images.length === 0 ? {} : { images }),
++        ...(subagents.length === 0 ? {} : { subagents }),
++        ...(messageActivities.length === 0 ? {} : { activities: messageActivities }),
+       });
+       continue;
+     }
+ 
++    if (
++      record.type === "response_item" &&
++      (record.payload?.type === "custom_tool_call" || record.payload?.type === "function_call")
++    ) {
++      const toolId = record.payload.call_id ?? record.payload.id;
++      if (toolId !== undefined) {
++        const result = codexToolResults.get(toolId);
++        retainMessage({
++          role: "assistant",
++          text: "",
++          ...(record.uuid === undefined ? {} : { sourceId: record.uuid }),
++          createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
++          codexResponseUser: false,
++          activities: [
++            {
++              kind: "tool",
++              id: toolId,
++              name: record.payload.name?.trim() || "Tool",
++              input: record.payload.input ?? {},
++              output: result?.text || null,
++              failed: result?.failed === true,
++              createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
++              completedAt:
++                result?.timestamp ?? normalizeTimestamp(record.timestamp, fallbackTimestamp),
++            },
++          ],
++        });
++      }
++      continue;
++    }
++
+     if (record.type === "session_meta") {
+       const sessionId = record.payload?.id?.trim() || record.payload?.session_id?.trim();
+       if (!hasCodexSessionId && sessionId) {
+@@ -484,7 +924,7 @@ function parseAgentSessionRecords(
+   const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
+   const retainedMessages = firstUserMessageRetained
+     ? visibleMessages
+-    : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
++    : [visibleFirstUserMessage, ...visibleMessages.slice(-(maxMessages - 1))];
+ 
+   return {
+     source: input.source,
+@@ -516,7 +956,16 @@ function shouldRetainDecodedRecord(
+       ? content.trim().length > 0
+       : (content?.some(
+           (block) => isTextContentBlock(block) && (block.text?.trim().length ?? 0) > 0,
+-        ) ?? false);
++        ) ??
++          false) ||
++          (content?.some(
++            (block) =>
++              block.type === "image" ||
++              block.type === "thinking" ||
++              block.type === "tool_use" ||
++              block.type === "tool_result",
++          ) ??
++            false);
+   }
+   if (extractDecodedCwd(record) !== null) return true;
+   return (
+@@ -525,7 +974,12 @@ function shouldRetainDecodedRecord(
+     (record.type === "event_msg" && record.payload?.type === "user_message") ||
+     (record.type === "response_item" &&
+       record.payload?.type === "message" &&
+-      (record.payload.role === "user" || record.payload.role === "assistant"))
++      (record.payload.role === "user" || record.payload.role === "assistant")) ||
++    (record.type === "response_item" &&
++      (record.payload?.type === "custom_tool_call" ||
++        record.payload?.type === "custom_tool_call_output" ||
++        record.payload?.type === "function_call" ||
++        record.payload?.type === "function_call_output"))
+   );
+ }
+ 
+@@ -810,6 +1264,7 @@ export const make = Effect.gen(function* () {
+     expected: ReturnType<typeof transcriptIdentity>,
+     recordLimit: number,
+     source: AgentSessionSource,
++    maxHistoryBytes = MAX_IMPORT_HISTORY_BYTES,
+   ) {
+     if (expected.size > MAX_IMPORTED_TRANSCRIPT_BYTES) return null;
+ 
+@@ -821,17 +1276,19 @@ export const make = Effect.gen(function* () {
+               return null;
+             }
+             const records: Array<DecodedTranscriptRecord> = [];
++            const claudeGraph: Array<ClaudeGraphNode> = [];
+             let cwd = Option.none<string>();
+             let claudeFields = emptyClaudeFields;
++            const retainedClaudeToolResultIds = new Set<string>();
+             let historyBytes = 0;
+             let recordBytes = 0;
+             let recordCount = 0;
+             let bytesRead = 0;
+             const reserve = (bytes: number) => {
+               recordBytes += bytes;
+-              if (historyBytes + recordBytes > MAX_IMPORT_HISTORY_BYTES) {
++              if (historyBytes + recordBytes > maxHistoryBytes) {
+                 throw new TranscriptJsonLimitError(
+-                  "Transcript selected history exceeds the 32 MiB memory budget",
++                  `Transcript selected history exceeds the ${maxHistoryBytes / (1024 * 1024)} MiB memory budget`,
+                 );
+               }
+             };
+@@ -848,8 +1305,22 @@ export const make = Effect.gen(function* () {
+                 if (Option.isNone(cwd)) cwd = Option.fromNullOr(extractDecodedCwd(decoded.value));
+                 if (source === "claudeAgent") {
+                   claudeFields = foldClaudeFields(claudeFields, decoded.value);
++                  const node = claudeGraphNode(decoded.value);
++                  if (Option.isSome(node)) claudeGraph.push(node.value);
+                 }
+-                if (shouldRetainDecodedRecord(source, decoded.value)) {
++                const toolResultId =
++                  source === "claudeAgent" && decoded.value.type === "user"
++                    ? Array.isArray(decoded.value.message?.content)
++                      ? decoded.value.message.content.find(
++                          (block) =>
++                            block.type === "tool_result" && block.tool_use_id !== undefined,
++                        )?.tool_use_id
++                      : undefined
++                    : undefined;
++                const retainToolResult =
++                  toolResultId === undefined || !retainedClaudeToolResultIds.has(toolResultId);
++                if (shouldRetainDecodedRecord(source, decoded.value) && retainToolResult) {
++                  if (toolResultId !== undefined) retainedClaudeToolResultIds.add(toolResultId);
+                   records.push(decoded.value);
+                   historyBytes += recordBytes;
+                 }
+@@ -888,7 +1359,7 @@ export const make = Effect.gen(function* () {
+ 
+             if (recordStarted && !(yield* Effect.try(finishRecord))) return null;
+             return sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))
+-              ? { records, recordCount, cwd, claudeFields }
++              ? { records, recordCount, cwd, claudeFields, claudeGraph }
+               : null;
+           }),
+         ),
+@@ -1305,6 +1776,7 @@ export const make = Effect.gen(function* () {
+   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
+     workspaceRoot: string,
+     completedSources: ReadonlyArray<AgentSessionImportSource>,
++    options: { readonly sessionId?: string; readonly includeOlder?: boolean },
+   ) {
+     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
+     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
+@@ -1313,7 +1785,10 @@ export const make = Effect.gen(function* () {
+     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+     const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
+ 
+-    const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
++    const candidates =
++      options.sessionId !== undefined || options.includeOlder === true
++        ? (yield* collectCandidates()).candidates
++        : (cachedCandidates ?? (yield* collectCandidates()).candidates);
+     cachedCandidates = candidates;
+ 
+     const eligibleTranscripts: Array<{
+@@ -1327,9 +1802,15 @@ export const make = Effect.gen(function* () {
+       if ((yield* directoryIdentity(resolved)) !== rootIdentity) continue;
+ 
+       for (const transcript of candidate.transcripts) {
++        if (
++          options.sessionId &&
++          candidate.source === "claudeAgent" &&
++          path.basename(transcript.filePath, ".jsonl") !== options.sessionId
++        )
++          continue;
+         if (
+           transcript.mtimeMs === null ||
+-          transcript.mtimeMs < cutoffMs ||
++          (!options.includeOlder && transcript.mtimeMs < cutoffMs) ||
+           transcript.mtimeMs > nowMs
+         ) {
+           continue;
+@@ -1355,7 +1836,8 @@ export const make = Effect.gen(function* () {
+     const importedSessions = new Set<string>();
+     let bytesRemaining = MAX_IMPORT_BYTES;
+     let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
+-    let recordsRemaining = MAX_IMPORT_RECORDS;
++    let recordsRemaining =
++      options.sessionId === undefined ? MAX_IMPORT_RECORDS : MAX_SELECTED_IMPORT_RECORDS;
+     return Stream.fromIteratorSucceed(eligibleTranscripts.values(), 1).pipe(
+       Stream.mapEffect(({ candidate, transcript }) =>
+         Effect.gen(function* () {
+@@ -1378,6 +1860,8 @@ export const make = Effect.gen(function* () {
+               source.provider === candidate.source && sameTranscriptIdentity(source, identity),
+           );
+           if (completedSource !== undefined) {
++            if (options.sessionId && completedSource.providerSessionId !== options.sessionId)
++              return Option.none<AgentSessionRecentThread>();
+             const sessionKey = `${completedSource.providerInstanceId}\0${completedSource.providerSessionId}`;
+             if (importedSessions.has(sessionKey)) return Option.none<AgentSessionRecentThread>();
+             importedSessions.add(sessionKey);
+@@ -1401,6 +1885,7 @@ export const make = Effect.gen(function* () {
+             identity,
+             recordsRemaining,
+             candidate.source,
++            options.sessionId === undefined ? undefined : MAX_SELECTED_IMPORT_HISTORY_BYTES,
+           );
+           if (snapshot === null) {
+             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+@@ -1424,14 +1909,19 @@ export const make = Effect.gen(function* () {
+               providerInstanceId: candidate.providerInstanceId,
+               fallbackSessionId: path.basename(transcript.filePath, ".jsonl"),
+               lastActiveAtMs: transcript.mtimeMs,
++              ...(options.sessionId ? { maxMessages: MAX_SELECTED_IMPORTED_MESSAGES } : {}),
+             },
+             snapshot.records,
+             snapshot.claudeFields,
++            snapshot.claudeGraph,
+           );
+           if (parsedThread === null) {
+             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+           }
+ 
++          if (options.sessionId && parsedThread.providerSessionId !== options.sessionId)
++            return Option.none<AgentSessionRecentThread>();
++
+           const source: AgentSessionImportSource = {
+             ...identity,
+             provider: parsedThread.source,
+@@ -1458,7 +1948,8 @@ export const make = Effect.gen(function* () {
+   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
+     workspaceRoot,
+     completedSources = [],
+-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
++    options = {},
++  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, options));
+ 
+   return AgentSessionScanner.of({ scan, recentThreads });
+ });
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index f461a99186..00234a17c9 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -191,6 +191,7 @@ import * as ProjectionStoreV2 from "./orchestration-v2/ProjectionStore.ts";
+ import { makePersistedServerRuntimeState } from "./serverRuntimeState.ts";
+ import { acceptsPrivateNetworkConnection, loopbackUrlHostForAddress } from "./startupAccess.ts";
+ import * as OrchestrationHttp from "./orchestration-v2/http.ts";
++import * as AgentSessionHttp from "./project/AgentSessionHttp.ts";
+ import * as ProjectHttp from "./project/http.ts";
+ import * as NetService from "@t3tools/shared/Net";
+ import * as RelayClient from "@t3tools/shared/relayClient";
+@@ -708,6 +709,7 @@ const layerMakeRoutes = Layer.mergeAll(
+       Layer.provide(McpOAuthHttp.layer.pipe(Layer.provide(McpOAuth.layer))),
+       Layer.provide(CloudHttp.layer),
+       Layer.provide(OrchestrationHttp.layer),
++      Layer.provide(AgentSessionHttp.layer),
+       Layer.provide(PullRequestHttp.layer),
+       Layer.provide(ProjectHttp.layer),
+       Layer.provide(ServerHttp.layerServerEnvironmentHttpApi),
+diff --git a/docs/internals/agent-session-import.md b/docs/internals/agent-session-import.md
+new file mode 100644
+index 0000000000..41e4f95f9d
+--- /dev/null
++++ b/docs/internals/agent-session-import.md
+@@ -0,0 +1,67 @@
++# Native agent-session import fidelity
++
++The session importer is deliberately a **native import**, not a legacy T3 database
++migration. It writes current v2 events and binds the imported provider thread to the
++original Claude or Codex native session.
++
++## Fidelity contract
++
++| Area | Current behavior | Evidence / boundary |
++| --- | --- | --- |
++| Native continuation | Claude imports keep `nativeThreadRef` and resume that session on the first follow-up. | On 2026-10-29, a copied 364 MB real session recalled an earlier conversation topic without tools. After restarting the built server, it recalled a different earlier discussion. Both protocol opens used `resume`, not `sessionId`. An exact `RESUME_OK` response alone does not establish retained context. |
++| Legacy handoff avoidance | Native imports use `historyOrigin: "native"`; `"v1_import"` would make the orchestrator create a legacy context handoff. | The first real continuation test failed through the handoff budget; changing the origin made direct native resume pass. |
++| Visible messages | User and assistant text is imported into current v2 message and turn-item events. | Scanner/importer tests and isolated projection. |
++| Claude branch | Only the current branch is imported. It is found on a parent graph of every main-chain record, because real sessions link prompts and replies through attachment, hook, and timing records the importer does not retain. The leaf is the latest visible message at or after Claude's `last-prompt` marker. | A walk over retained records alone stopped after 2–3 records on real sessions and fell back to the whole file, mixing abandoned branches in. The 364 MB session now imports its full 732-prompt branch. |
++| Provider turns/nodes | Historical provider turns and execution nodes are emitted with weak native item refs. | Isolated Claude projection: 9,780 nodes for the 364 MB session. |
++| Claude images | Inline base64 Claude images are persisted under T3’s attachment store with deterministic IDs and attached to imported messages. | Target transcript produced 51 persisted image files / 51 unique attachment payloads. Remote image URLs are not downloaded. |
++| Claude subagents | Native `Agent`/`Task` calls produce subagent nodes, subagent projections, and subagent turn items with prompt/result/status/native task refs. | Target projection produced 24 subagents and 24 subagent turn items. |
++| Claude reasoning/tools | Thinking blocks become reasoning items. Tool calls go through the live adapter's `claudeToolTurnItem` with the transcript's structured `toolUseResult`, so they render as live Claude tools do: command, file change, web search, or MCP-branded dynamic tool. Tool results are deduplicated by tool ID while reading large transcripts. | Importer test; target projection produced 2,654 command, 243 file change, 29 web search, and 304 dynamic tool items. |
++| Claude compaction | Compact boundaries on the branch reconnect through `logicalParentUuid` (only toward an older record) and become `compaction` items on the next imported message. | Scanner test; 13 of 13 boundaries in the target session. |
++| Codex tools | `custom_tool_call`/`function_call` and corresponding output records become tool activities and current T3 tool items. | Synthetic Codex fixture coverage. |
++| Idempotency | Re-importing an unchanged source is recognized as already imported; event IDs and attachment IDs are deterministic. | Importer tests and repeated isolated imports. |
++| Restart durability | v2 projection, provider binding, subagents, turns, and attachments survive server restart. | Isolated restart query verified provider native ID, 2,335 turns, nodes, and attachments. |
++
++## Intentional limits
++
++These are not silently treated as native parity:
++
++- Claude currently imports the selected/current native leaf. Historical alternate
++  Claude branches are not emitted as separate resumable T3 threads; only the selected
++  leaf can safely preserve one native resume destination.
++- Codex tool activity is supported, but Codex-specific native subagent/task shapes,
++  encrypted reasoning payloads, and provider-private artifacts are not decoded when
++  the rollout does not expose readable content.
++- Remote image URLs are represented only when the source provides inline bytes; the
++  importer does not fetch network resources during import.
++- A project’s historical Git branch, worktree checkout, uncommitted files, and
++  checkpoint blobs are not reconstructed. Continuation runs in the selected T3
++  project workspace, by design.
++- The `t3 import session` CLI requires a running-server URL, a scoped bearer token,
++  and a T3 project ID.
++- Claude's trailing tool activity after the last visible message is not imported; it
++  belongs to a turn that never produced a reply.
++- TodoWrite and ExitPlanMode calls import as tool items, not as plan artifacts.
++- Selected sessions have a 512 MiB selected-history memory budget, a 1,000,000-record
++  limit, and keep up to 100,000 messages; bulk discovery keeps its 32 MiB, 100,000-record,
++  and 200-message limits. Larger selected histories are skipped with a warning. The
++  budget counts selected fields, not the JSONL file size: the 364 MB target session
++  selects roughly 70 MB.
++
++## Verification command set
++
++From `apps/server`:
++
++```bash
++vp test run src/project/AgentSessionScanner.test.ts \
++  src/project/AgentSessionImporter.test.ts \
++  src/project/AgentSessionJson.test.ts \
++  src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
++vp run typecheck
++```
++
++The current focused suite passes 311 tests, including regressions for the old
++selected-history budget, branch walks through unretained records, and compaction.
++The server typecheck and production server/web build pass.
++
++These checks exercise the patched stable build. They do not patch an installed
++nightly or repair threads already imported there using `historyOrigin: "v1_import"`.
+diff --git a/packages/contracts/src/agentSessions.ts b/packages/contracts/src/agentSessions.ts
+index a60d702d9a..c13516de06 100644
+--- a/packages/contracts/src/agentSessions.ts
++++ b/packages/contracts/src/agentSessions.ts
+@@ -51,6 +51,8 @@ export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
+ export const AgentSessionImportInput = Schema.Struct({
+   projectId: ProjectId,
+   expectedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
++  sessionId: Schema.optional(TrimmedNonEmptyString),
++  includeOlder: Schema.optional(Schema.Boolean),
+ });
+ export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;
+ 
+diff --git a/packages/contracts/src/environmentHttp.ts b/packages/contracts/src/environmentHttp.ts
+index 330e292181..953443f6f0 100644
+--- a/packages/contracts/src/environmentHttp.ts
++++ b/packages/contracts/src/environmentHttp.ts
+@@ -57,6 +57,7 @@ import {
+   OrchestrationV2ThreadHistoryPage,
+   OrchestrationV2ThreadTranscript,
+ } from "./orchestrationV2.ts";
++import { AgentSessionImportInput, AgentSessionImportResult } from "./agentSessions.ts";
+ import { Project, ProjectMutation, ProjectSnapshot } from "./project.ts";
+ import {
+   PullRequestDiffInput,
+@@ -692,6 +693,16 @@ const EnvironmentOrchestrationThreadHistoryErrors = [
+   EnvironmentInternalError,
+ ] as const;
+ 
++class EnvironmentAgentSessionsHttpApi extends HttpApiGroup.make("agentSessions")
++  .add(
++    HttpApiEndpoint.post("import", "/api/agent-sessions/import", {
++      headers: OrchestrationProtocolHeaders,
++      payload: AgentSessionImportInput,
++      success: AgentSessionImportResult,
++      error: EnvironmentOrchestrationSnapshotErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  ) {}
++
+ class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
+   .add(
+     HttpApiEndpoint.get("shellSnapshot", "/api/orchestration/shell", {
+@@ -861,6 +872,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
+   .add(EnvironmentAuthHttpApi)
+   .add(EnvironmentMcpOAuthHttpApi)
+   .add(EnvironmentOrchestrationHttpApi)
++  .add(EnvironmentAgentSessionsHttpApi)
+   .add(EnvironmentPullRequestsHttpApi)
+   .add(EnvironmentProjectsHttpApi)
+   .add(EnvironmentConnectHttpApi)
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 96751b0107..395804532d 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -6,6 +6,9 @@ importers:
+   .:
+     configDependencies: {}
+     packageManagerDependencies:
++      '@pnpm/exe':
++        specifier: 12.14.0
++        version: 12.14.0
+       pnpm:
+         specifier: 12.14.0
+         version: 12.14.0
+@@ -89,6 +92,11 @@ packages:
+     cpu: [x64]
+     os: [win32]
+ 
++  '@pnpm/exe@12.14.0':
++    resolution: {integrity: sha512-iZCbiKegYUapNVkZY4O8vjXt9EF/j34LbDvew6qUM5g/HrxMY38cFJaoE8+5ZWQfbt2YCsLfufI5TTh+GxUbWw==}
++    engines: {node: '>=18.*'}
++    hasBin: true
++
+   pnpm@12.14.0:
+     resolution: {integrity: sha512-wYum2HmT09Fky16JSPMrLAbuhUSH4GzY2GeBNC+z5btGNDZwNHEehoArqpw3vqkGzhkprQjXCITJfYAd8TOJpg==}
+     engines: {node: '>=18.*'}
+@@ -138,6 +146,23 @@ snapshots:
+   '@pnpm/exe.win32-x64@12.14.0':
+     optional: true
+ 
++  '@pnpm/exe@12.14.0':
++    optionalDependencies:
++      '@pnpm/exe.android-arm64': 12.14.0
++      '@pnpm/exe.android-x64': 12.14.0
++      '@pnpm/exe.darwin-arm64': 12.14.0
++      '@pnpm/exe.darwin-x64': 12.14.0
++      '@pnpm/exe.freebsd-x64': 12.14.0
++      '@pnpm/exe.linux-arm64': 12.14.0
++      '@pnpm/exe.linux-arm64-musl': 12.14.0
++      '@pnpm/exe.linux-ppc64': 12.14.0
++      '@pnpm/exe.linux-riscv64': 12.14.0
++      '@pnpm/exe.linux-s390x': 12.14.0
++      '@pnpm/exe.linux-x64': 12.14.0
++      '@pnpm/exe.linux-x64-musl': 12.14.0
++      '@pnpm/exe.win32-arm64': 12.14.0
++      '@pnpm/exe.win32-x64': 12.14.0
++
+   pnpm@12.14.0:
+     optionalDependencies:
+       '@pnpm/exe.android-arm64': 12.14.0
