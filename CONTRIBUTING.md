@@ -24,7 +24,7 @@ The Python helpers use only the standard library and need no virtual environment
 | `scripts/stable.py` | Linux session selection, project matching, API import, and stable-server lifecycle. |
 | `scripts/nightly.py` | Arch-specific checks, database backup, temporary nightly import, and app relaunch. |
 | `scripts/build-stable.sh` | Pinned upstream clone, patch application, and build. |
-| `patches/stable-session-import.patch` | Server scanner/importer, native Claude resume fix, contracts, CLI/HTTP integration, tests, and upstream documentation. |
+| `patches/stable-session-import.patch` | Native history readers, scanner/importer, native Claude resume fix, contracts, CLI/HTTP integration, tests, and upstream documentation. |
 | `vendor/t3code/apps/server/src/project/` | Working copies of the scanner/importer and their tests after setup. |
 | `vendor/t3code/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts` | Claude provider continuation and tool-item conversion. |
 
@@ -38,6 +38,7 @@ From this repository's root:
 
 ```bash
 python3 -m py_compile scripts/stable.py scripts/nightly.py
+python3 -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/stable.py --help
 python3 scripts/nightly.py --help
 bash -n scripts/build-stable.sh
@@ -51,8 +52,10 @@ node_modules/.bin/vp test run \
   apps/server/src/project/AgentSessionScanner.test.ts \
   apps/server/src/project/AgentSessionImporter.test.ts \
   apps/server/src/project/AgentSessionJson.test.ts \
+  apps/server/src/project/AgentSessionNative.test.ts \
+  apps/server/src/project/AgentSessionNativeSource.test.ts \
   apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-node_modules/.bin/vp run --filter t3 typecheck
+node_modules/.bin/vp run --filter t3 --filter @t3tools/contracts --filter @t3tools/provider-opencode typecheck
 ```
 
 Run lint on the upstream files you changed and rebuild when the change affects

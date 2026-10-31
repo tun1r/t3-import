@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the patched stable build and import Claude Code sessions into it."""
+"""Run the patched stable build and import Claude Code, Codex, or OpenCode 2 sessions."""
 import argparse
 import json
 import os
@@ -140,7 +140,28 @@ def open_session_ids():
     return ids
 
 
-def list_sessions():
+def issue_token():
+    start()
+    return subprocess.run(
+        ["node", str(CLI), "auth", "session", "issue", "--base-dir", str(BASE), "--ttl", "15m",
+         "--label", "t3-import", "--token-only"],
+        capture_output=True, text=True, check=True).stdout.strip()
+
+
+def native_sessions(provider, instance, token):
+    payload = {"source": provider}
+    if instance:
+        payload["providerInstanceId"] = instance
+    return api(token, "POST", "/api/agent-sessions/list", payload)["sessions"]
+
+
+def list_sessions(provider="claudeAgent", instance=None):
+    if provider != "claudeAgent":
+        for session in native_sessions(provider, instance, issue_token()):
+            print(f"{session['sessionId']}  {session['updatedAt']}  "
+                  f"{session['providerInstanceId']}  {session['title'][:50]}  "
+                  f"{session['workspaceRoot']}")
+        return
     running = open_session_ids()
     for path in session_files():
         cwd, title = session_details(path)
@@ -165,22 +186,31 @@ def api(token, method, route, payload=None):
                            f"{error.read().decode(errors='replace')[:500]}") from None
 
 
-def import_session(session_id, force):
-    path = next((path for path in session_files() if path.stem == session_id), None)
-    if path is None:
-        raise RuntimeError(f"No Claude session {session_id} under {CLAUDE / 'projects'}")
-    if session_id in open_session_ids() and not force:
-        raise RuntimeError("That session is still open in Claude Code. Close it first, so "
-                           "Claude Code and T3 do not both write to it, or pass --force.")
-    cwd, title = session_details(path)
+def import_session(session_id, force=False, provider="claudeAgent", instance=None):
+    if provider == "claudeAgent":
+        path = next((path for path in session_files() if path.stem == session_id), None)
+        if path is None:
+            raise RuntimeError(f"No Claude session {session_id} under {CLAUDE / 'projects'}")
+        if session_id in open_session_ids() and not force:
+            raise RuntimeError("That session is still open in Claude Code. Close it first, so "
+                               "Claude Code and T3 do not both write to it, or pass --force.")
+        cwd, title = session_details(path)
+        provider_instance = "claudeAgent"
+        token = None
+    else:
+        if force:
+            raise RuntimeError("--force applies only to Claude; native API snapshot checks cannot be bypassed.")
+        token = issue_token()
+        session = next((s for s in native_sessions(provider, instance, token)
+                        if s["sessionId"] == session_id), None)
+        if session is None:
+            raise RuntimeError(f"No {provider} session {session_id} in the selected provider instance")
+        cwd, title = session["workspaceRoot"], session["title"]
+        provider_instance = session["providerInstanceId"]
     if not cwd or not Path(cwd).is_dir():
         raise RuntimeError(f"The session's folder no longer exists: {cwd or 'unknown'}")
     workspace = str(Path(cwd).resolve())
-    start()
-    token = subprocess.run(
-        ["node", str(CLI), "auth", "session", "issue", "--base-dir", str(BASE), "--ttl", "5m",
-         "--label", "t3-import", "--token-only"],
-        capture_output=True, text=True, check=True).stdout.strip()
+    token = token or issue_token()
     projects = api(token, "GET", "/api/projects")["projects"]
     project = next((project for project in projects if project["deletedAt"] is None and
                     str(Path(project["workspaceRoot"]).resolve()) == workspace), None)
@@ -191,7 +221,7 @@ def import_session(session_id, force):
             "workspaceRoot": workspace,
         })
         print(f"Created project {project['title']} for {workspace}")
-    thread_id = urllib.parse.quote(f"import:claudeAgent:{session_id}", safe="")
+    thread_id = urllib.parse.quote(f"import:{provider_instance}:{session_id}", safe="")
     link = f"{ORIGIN}/{(BASE / 'userdata/environment-id').read_text().strip()}/{thread_id}"
     try:
         api(token, "GET", f"/api/orchestration/threads/{thread_id}")
@@ -202,11 +232,12 @@ def import_session(session_id, force):
             raise
     result = api(token, "POST", "/api/agent-sessions/import", {
         "projectId": project["id"], "expectedWorkspaceRoot": project["workspaceRoot"],
-        "sessionId": session_id, "includeOlder": True,
+        "sessionId": session_id, "includeOlder": True, "source": provider,
+        "providerInstanceId": provider_instance,
     })
     if result["importedCount"] == 0:
-        raise RuntimeError("Nothing imported: the session's history exceeded the import "
-                           "limits; see .runtime/stable.log.")
+        raise RuntimeError("Nothing imported: a history limit or native-session ownership "
+                           "check prevented the import; see .runtime/stable.log.")
     print(f"Imported {title or session_id} into {project['title']}")
     return link
 
@@ -216,16 +247,21 @@ def main():
     parser.add_argument("command", nargs="?", default="open",
                         choices=["start", "stop", "restart", "status", "open", "sessions",
                                  "import"])
-    parser.add_argument("session_id", nargs="?", help="Claude session ID for import")
+    parser.add_argument("session_id", nargs="?", help="Native session ID for import")
     parser.add_argument("--force", action="store_true",
                         help="import even if the session is still open in Claude Code")
+    parser.add_argument("--provider", choices=["claudeAgent", "codex", "opencode"],
+                        default="claudeAgent", help="session source; opencode requires OpenCode 2")
+    parser.add_argument("--instance", help="configured T3 provider instance ID for Codex/OpenCode")
     args = parser.parse_args()
+    if args.instance and args.provider == "claudeAgent":
+        parser.error("--instance is currently supported for Codex and OpenCode 2")
     if args.command == "sessions":
-        return list_sessions()
+        return list_sessions(args.provider, args.instance)
     if args.command == "import":
         if not args.session_id:
             parser.error("import needs a session ID; list them with: stable.py sessions")
-        return print(import_session(args.session_id, args.force))
+        return print(import_session(args.session_id, args.force, args.provider, args.instance))
     if args.command in ["stop", "restart"]:
         stop()
     if args.command in ["start", "restart"]:

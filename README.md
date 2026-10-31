@@ -2,13 +2,13 @@
 
 # t3-import
 
-Import an existing Claude Code conversation into [T3 Code](https://github.com/pingdotgg/t3code)
+Import an existing Claude Code, Codex, or OpenCode 2 conversation into [T3 Code](https://github.com/pingdotgg/t3code)
 and continue its native session. This repository contains a patch for T3 stable
 `v0.1.3`, a reproducible build script, and Python helpers for selecting sessions.
 It is an independent project, not an official T3 release.
 
-The patch preserves the selected conversation branch, tool activity, thinking,
-inline images, subagents, and compaction markers. It also fixes Claude's first
+The patch preserves the selected conversation branch, exposed reasoning, tool activity,
+attachments, subagent activity, and compaction markers. It also fixes Claude's first
 follow-up after import so the provider resumes the existing session.
 
 ## Requirements
@@ -18,8 +18,11 @@ follow-up after import so the provider resumes the existing session.
 - Node **26.12.1** and pnpm **12.14.0**, matching the pinned upstream checkout.
   Install Node with your preferred version manager, then install pnpm with
   `npm install --global pnpm@12.14.0`.
-- A working, authenticated Claude Code installation with sessions in `~/.claude`,
-  or in the directory specified by `CLAUDE_CONFIG_DIR`.
+- An authenticated installation of the provider you want to continue: Claude Code,
+  Codex, or OpenCode **2**. Codex native APIs were exercised with CLI **0.166.0**;
+  OpenCode with **2.0.28** (`@opencode/cli`, separate from the 1.x package).
+- Claude sessions in `~/.claude` or `CLAUDE_CONFIG_DIR`; Codex/OpenCode use the
+  provider instance configured in the separate T3 server.
 - A browser and `xdg-open` to use the `open` command.
 - Internet access for the initial upstream clone and dependency installation.
   Native dependency builds may also require your distribution's C/C++ build tools.
@@ -55,15 +58,57 @@ The server listens at **http://127.0.0.1:3784**. Its state lives in
 `.runtime/stable`, separately from an installed nightly's data. Keep this checkout
 if you want to retain that state.
 
+## Codex and OpenCode 2
+
+Open the separate T3 server and configure the relevant provider under **Settings >
+Providers**. Enable OpenCode and point its binary path at an OpenCode 2 binary, or
+configure an existing OpenCode 2 server URL and password. Installing OpenCode 2 can
+migrate its database; follow OpenCode's migration guidance before replacing 1.x.
+This importer rejects 1.x exports.
+
+List and import through the provider's native history API:
+
+```bash
+python3 scripts/stable.py sessions --provider codex
+python3 scripts/stable.py import SESSION_ID --provider codex
+python3 scripts/stable.py sessions --provider opencode
+python3 scripts/stable.py import SESSION_ID --provider opencode
+```
+
+For a named provider instance/account, pass its T3 instance ID consistently:
+
+```bash
+python3 scripts/stable.py sessions --provider codex --instance codex-personal
+python3 scripts/stable.py import SESSION_ID --provider codex --instance codex-personal
+```
+
+The default instance IDs are `codex` and `opencode`. The importer checks that the
+selected instance belongs to the requested provider and that the native workspace
+matches the destination project. It never selects another account automatically.
+Secrets stay in the server's provider configuration; listing returns session
+metadata only.
+
+Codex history comes from `thread/read`, with full turn pagination when required,
+including archived sessions. OpenCode 2 history comes from its complete session
+export, respecting any revert boundary. Imports use stable snapshots; active
+sessions, changes during the read, missing local images, incomplete history, and
+exceeded limits fail rather than producing a partial successful import.
+
+Close the source conversation before importing, including other provider processes
+that might write to it. Provider APIs do not offer a global lock across independent
+CLI processes. `--force` is only available for the existing Claude open-session
+check and cannot bypass native API checks.
+
 ## Continuing an imported conversation
 
-Continuation resumes the original Claude session and writes new turns to its
-provider history. Keep the original Claude session files available. Avoid using
-that session in Claude Code and T3 at the same time. The helper refuses sessions
-registered as open in Claude Code; `--force` bypasses that check.
+Continuation binds to the original native session and writes new turns to its
+provider history. Keep the original provider data available and use the same T3
+provider instance. Avoid using the session in its CLI and T3 at the same time.
+For Claude, the helper refuses sessions registered as open; `--force` bypasses
+that Claude-specific check.
 
 Importing the same session again returns the existing thread link. It does not
-refresh the displayed transcript or synchronize subsequent Claude Code changes.
+refresh the displayed transcript or synchronize subsequent changes in the provider.
 A deleted T3 thread can still reserve its native session ID; deleting the visible
 thread does not guarantee that the same ID can be imported again.
 
@@ -104,8 +149,12 @@ Stop an existing helper server before changing its Claude configuration.
 | Claude branches | Imports the selected/current branch. Alternate historical branches are not separate resumable T3 threads. |
 | Displayed activity | Text, supported tools, thinking, inline images, subagents, and compaction markers. Trailing tool activity after the last visible message is omitted. |
 | Selected-session limits | Up to 512 MiB of selected conversation data, 1,000,000 records, and 100,000 messages. File size alone does not determine this budget. |
-| Images | Persists inline image bytes; does not download remote images. |
-| Codex | The server patch handles Codex import and tool activity; the Python selection helper is Claude-only. Native Codex continuation has not been verified here. |
+| Attachments | Persists inline images, Codex local images, and OpenCode binary files. Missing referenced local images fail the import. Remote images are not downloaded. |
+| Codex | Native full history and archived listing; commands/exit codes, multi-file diffs, plans, exposed reasoning, MCP/unknown tool records, compactions, and delegation activity. Native turn IDs are retained. |
+| OpenCode 2 | Complete projected exports, ordered text/reasoning/tools, shell output, files, control messages, compactions, and revert boundaries. Tool rendering uses T3’s live OpenCode mapper. |
+| Native API limits | 512 MiB per snapshot, 100,000 projected messages, and 1,000 pages per paginated operation. Limits fail explicitly; history is not silently truncated. |
+| Model selection | Uses the exposed native model ID. If the API omits it, T3 uses its default; select the desired model before continuing. |
+| Provider-private data | Encrypted reasoning and provider-private context/artifacts are not recoverable through the exposed history API. Child-session activity/results are shown; child conversations are imported separately. |
 | Installed desktop app | The stable build does not update or patch it. Nightly import requires the separate procedure below. |
 
 ## Installed nightly (advanced, Arch Linux only)
@@ -182,12 +231,12 @@ upstream license notices.
 
 ## Development and verification
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for tests, patch regeneration, and pull
-requests. On 2026-10-30, all 311 focused scanner/importer/JSON/Claude-adapter tests passed;
-Python syntax, CLI help, shell syntax, and patch consistency checks also passed.
-Earlier isolated Linux checks exercised a large transcript, idempotency, open-session
-refusal, native continuation before/after restart, typecheck, lint, and production
-build. Browser rendering and other operating systems were not verified.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for focused tests, patch regeneration, and
+pull requests. Verification covers synthetic parsing, native API pagination and
+snapshot checks, database projections, attachments, ownership, and idempotency.
+Live protocol checks use disposable provider homes; they do not certify every
+provider version or encrypted/private data. Browser rendering and other operating
+systems have not been verified.
 
 Project code is [MIT licensed](LICENSE). T3 Code's copyright and license are
 preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

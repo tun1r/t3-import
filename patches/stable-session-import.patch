@@ -18,21 +18,22 @@ index 2f7c24536c..278abb381e 100644
      ]),
 diff --git a/apps/server/src/cli/importSession.ts b/apps/server/src/cli/importSession.ts
 new file mode 100644
-index 0000000000..68d9dc296d
+index 0000000000..91634a4eab
 --- /dev/null
 +++ b/apps/server/src/cli/importSession.ts
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,75 @@
 +import {
 +  AgentSessionImportInput,
 +  EnvironmentHttpApi,
 +  ORCHESTRATION_PROTOCOL_HEADER,
 +  ProjectId,
++  ProviderInstanceId,
 +} from "@t3tools/contracts";
 +import * as Console from "effect/Console";
 +import * as Effect from "effect/Effect";
 +import * as Option from "effect/Option";
 +import { Argument, Command, Flag } from "effect/cli";
-+import { FetchHttpClient, HttpClient } from "effect/http";
++import { FetchHttpClient } from "effect/http";
 +import * as HttpApiClient from "effect/http-api/HttpApiClient";
 +
 +const importProviderSessionCommand = Command.make("session", {
@@ -46,17 +47,23 @@ index 0000000000..68d9dc296d
 +    Argument.withDescription("T3 project ID to receive the imported session."),
 +  ),
 +  sessionId: Argument.String("session-id").pipe(
-+    Argument.withDescription("Claude or Codex native session ID."),
++    Argument.withDescription("Claude Code, Codex, or OpenCode 2 native session ID."),
 +  ),
++  source: Flag.Literals("provider", ["claudeAgent", "codex", "opencode"]).pipe(Flag.optional),
++  instance: Flag.String("instance").pipe(Flag.optional),
 +  workspace: Flag.String("workspace").pipe(
-+    Flag.withDescription("Expected project workspace path; prevents importing into a moved project."),
++    Flag.withDescription(
++      "Expected project workspace path; prevents importing into a moved project.",
++    ),
 +    Flag.optional,
 +  ),
 +  includeOlder: Flag.Boolean("include-older").pipe(
 +    Flag.withDescription("Include sessions older than the normal discovery window."),
 +  ),
 +}).pipe(
-+  Command.withDescription("Import one existing Claude or Codex session into a live T3 project."),
++  Command.withDescription(
++    "Import one existing Claude Code, Codex, or OpenCode 2 session into a live T3 project.",
++  ),
 +  Command.withHandler((flags) =>
 +    Effect.gen(function* () {
 +      const client = yield* HttpApiClient.make(EnvironmentHttpApi, {
@@ -64,6 +71,10 @@ index 0000000000..68d9dc296d
 +      });
 +      const input = {
 +        projectId: ProjectId.make(flags.projectId),
++        ...(Option.isNone(flags.source) ? {} : { source: flags.source.value }),
++        ...(Option.isNone(flags.instance)
++          ? {}
++          : { providerInstanceId: ProviderInstanceId.make(flags.instance.value) }),
 +        ...(Option.isNone(flags.workspace) ? {} : { expectedWorkspaceRoot: flags.workspace.value }),
 +        sessionId: flags.sessionId,
 +        includeOlder: flags.includeOlder,
@@ -87,19 +98,23 @@ index 0000000000..68d9dc296d
 +  Command.withSubcommands([importProviderSessionCommand]),
 +);
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index 7fece9817c..9dab6f2496 100644
+index 7fece9817c..fff489ce3e 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-@@ -2323,7 +2323,7 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
+@@ -2323,7 +2323,11 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
  });
  
  describe("ClaudeAdapterV2 native session identity", () => {
 -  const openTurnWithOrdinal = (providerTurnOrdinal: number, nativeThreadHasTurns?: boolean) =>
-+  const openTurnWithOrdinal = (providerTurnOrdinal: number, nativeThreadHasTurns?: boolean, imported = false) =>
++  const openTurnWithOrdinal = (
++    providerTurnOrdinal: number,
++    nativeThreadHasTurns?: boolean,
++    imported = false,
++  ) =>
      Effect.scoped(
        Effect.gen(function* () {
          const fileSystem = yield* FileSystem.FileSystem;
-@@ -2376,6 +2376,7 @@ describe("ClaudeAdapterV2 native session identity", () => {
+@@ -2376,6 +2380,7 @@ describe("ClaudeAdapterV2 native session identity", () => {
            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
            runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
          });
@@ -107,7 +122,7 @@ index 7fece9817c..9dab6f2496 100644
          const now = yield* DateTime.now;
          yield* runtime.startTurn(
            makeClaudeTestTurnInput({
-@@ -2408,6 +2409,14 @@ describe("ClaudeAdapterV2 native session identity", () => {
+@@ -2408,6 +2413,14 @@ describe("ClaudeAdapterV2 native session identity", () => {
        }),
    );
  
@@ -123,7 +138,7 @@ index 7fece9817c..9dab6f2496 100644
      Effect.gen(function* () {
        const openedQueries = yield* openTurnWithOrdinal(4, false);
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index 94ccc16dda..0e7727f08a 100644
+index 94ccc16dda..fa9fbbf524 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 @@ -2615,7 +2615,7 @@ const CLAUDE_KNOWN_TOOL_CLASSIFICATIONS: Record<
@@ -285,24 +300,6 @@ index 94ccc16dda..0e7727f08a 100644
  function summarizeClaudeToolRequest(toolName: string, input: ClaudeNativeToolInput): string {
    const command = firstStringInputField(input, ["command", "cmd", "script"]);
    if (command !== undefined) {
-@@ -4039,7 +4173,7 @@ export function claudeSdkUserInputAnswers(
-   );
- }
- 
--function claudeTodoSteps(input: unknown): ReadonlyArray<OrchestrationV2PlanStep> {
-+export function claudeTodoSteps(input: unknown): ReadonlyArray<OrchestrationV2PlanStep> {
-   const value =
-     typeof input === "object" && input !== null && Reflect.get(input, "type") === "record"
-       ? Reflect.get(input, "value")
-@@ -4207,7 +4341,7 @@ function claudeTaskSteps(tasks: ClaudeTaskList): ReadonlyArray<OrchestrationV2Pl
-   return [...tasks].map(([id, task]) => ({ id: `task-${id}`, ...task }));
- }
- 
--function claudeProposedPlan(input: unknown): string | null {
-+export function claudeProposedPlan(input: unknown): string | null {
-   const value =
-     typeof input === "object" && input !== null && Reflect.get(input, "type") === "record"
-       ? Reflect.get(input, "value")
 @@ -5328,131 +5462,32 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              startedAt: input.startedAt,
              completedAt,
@@ -487,12 +484,30 @@ index 94ccc16dda..0e7727f08a 100644
                const updatedAt = yield* DateTime.now;
                return {
                  ...threadInput.providerThread,
+diff --git a/apps/server/src/orchestration-v2/runtimeLayer.ts b/apps/server/src/orchestration-v2/runtimeLayer.ts
+index eb6f9d1d3e..520fcca47e 100644
+--- a/apps/server/src/orchestration-v2/runtimeLayer.ts
++++ b/apps/server/src/orchestration-v2/runtimeLayer.ts
+@@ -1,3 +1,5 @@
++import * as AgentSessionNativeTransport from "../project/AgentSessionNativeTransport.ts";
++import * as AgentSessionNativeSource from "../project/AgentSessionNativeSource.ts";
+ import * as GuestShareService from "../guest/GuestShareService.ts";
+ import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
+ import * as Scheduler from "../scheduling/Scheduler.ts";
+@@ -241,6 +243,7 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
+   Layer.provide(
+     Layer.mergeAll(
+       AgentSessionScanner.layer,
++      AgentSessionNativeSource.layer.pipe(Layer.provide(AgentSessionNativeTransport.layer)),
+       layerProjectService,
+       layerOrchestratorProvided,
+       layerEventSinkProvided,
 diff --git a/apps/server/src/project/AgentSessionHttp.ts b/apps/server/src/project/AgentSessionHttp.ts
 new file mode 100644
-index 0000000000..220f9b4e94
+index 0000000000..69acd724e1
 --- /dev/null
 +++ b/apps/server/src/project/AgentSessionHttp.ts
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,47 @@
 +import { AuthOrchestrationOperateScope, EnvironmentHttpApi } from "@t3tools/contracts";
 +import * as Effect from "effect/Effect";
 +import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
@@ -509,23 +524,44 @@ index 0000000000..220f9b4e94
 +  "agentSessions",
 +  Effect.fnUntraced(function* (handlers) {
 +    const importer = yield* AgentSessionImporter.AgentSessionImporter;
-+    return handlers.handle(
-+      "import",
-+      Effect.fn("environment.agentSessions.import")(function* (args) {
-+        yield* annotateEnvironmentRequest(args.endpoint.name);
-+        yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
-+        return yield* importer.importRecentAgentThreads(args.payload).pipe(
-+          Effect.catch((cause) => failEnvironmentInternal("orchestration_snapshot_failed", cause)),
-+        );
-+      }),
-+    );
++    return handlers
++      .handle(
++        "list",
++        Effect.fn("environment.agentSessions.list")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
++          return yield* importer
++            .listNativeSessions(args.payload)
++            .pipe(
++              Effect.catch((cause) =>
++                failEnvironmentInternal("orchestration_snapshot_failed", cause),
++              ),
++            );
++        }),
++      )
++      .handle(
++        "import",
++        Effect.fn("environment.agentSessions.import")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
++          return yield* importer
++            .importRecentAgentThreads(args.payload)
++            .pipe(
++              Effect.catch((cause) =>
++                failEnvironmentInternal("orchestration_snapshot_failed", cause),
++              ),
++            );
++        }),
++      );
 +  }),
 +);
 diff --git a/apps/server/src/project/AgentSessionImporter.test.ts b/apps/server/src/project/AgentSessionImporter.test.ts
-index 69026f9120..fed0d28b88 100644
+index 69026f9120..e972d8b140 100644
 --- a/apps/server/src/project/AgentSessionImporter.test.ts
 +++ b/apps/server/src/project/AgentSessionImporter.test.ts
-@@ -1,4 +1,7 @@
+@@ -1,4 +1,9 @@
++import { parseCodexSession, parseOpenCode2Session } from "./AgentSessionNative.ts";
++import * as AgentSessionNativeSource from "./AgentSessionNativeSource.ts";
  import { expect, it } from "@effect/vitest";
 +import * as NodeServices from "@effect/platform-node/NodeServices";
 +import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
@@ -533,7 +569,7 @@ index 69026f9120..fed0d28b88 100644
  import {
    EventId,
    ProjectId,
-@@ -14,13 +17,16 @@ import * as Context from "effect/Context";
+@@ -14,13 +19,16 @@ import * as Context from "effect/Context";
  import * as DateTime from "effect/DateTime";
  import * as Deferred from "effect/Deferred";
  import * as Effect from "effect/Effect";
@@ -550,7 +586,7 @@ index 69026f9120..fed0d28b88 100644
  import * as EventStore from "../orchestration-v2/EventStore.ts";
  import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
  import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
-@@ -45,6 +51,12 @@ const persistence = Layer.mergeAll(
+@@ -45,6 +53,12 @@ const persistence = Layer.mergeAll(
    EventSink.layer.pipe(Layer.provide(stores)),
    ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
    IdAllocator.layer,
@@ -563,8 +599,31 @@ index 69026f9120..fed0d28b88 100644
  );
  
  function candidate(
-@@ -166,6 +178,9 @@ const makeImporter = Effect.fn(function* (
+@@ -82,7 +96,9 @@ function candidate(
+   } satisfies AgentSessionScanner.AgentSessionRecentThread;
+ }
+ 
+-function importId(source: ReturnType<typeof candidate>) {
++function importId(
++  source: Extract<AgentSessionScanner.AgentSessionRecentThread, { _tag: "Importable" }>,
++) {
+   return ThreadId.make(
+     `import:${source.source.providerInstanceId}:${source.source.providerSessionId}`,
+   );
+@@ -162,10 +178,20 @@ const seedOwner = Effect.fn(function* (
+ });
+ 
+ const makeImporter = Effect.fn(function* (
+-  candidates: ReadonlyArray<ReturnType<typeof candidate>>,
++  candidates: ReadonlyArray<
++    Extract<AgentSessionScanner.AgentSessionRecentThread, { _tag: "Importable" }>
++  >,
    beforeTransaction: Effect.Effect<void> = Effect.void,
++  nativeInput?: {
++    source: "claudeAgent" | "codex" | "opencode";
++    sessionId: string;
++    providerInstanceId: ProviderInstanceId;
++  },
  ) {
    const sql = yield* SqlClient.SqlClient;
 +  const fileSystem = yield* FileSystem.FileSystem;
@@ -573,7 +632,17 @@ index 69026f9120..fed0d28b88 100644
    const events = yield* EventStore.EventStoreV2;
    const projections = yield* ProjectionStore.ProjectionStoreV2;
    const published: Array<ApplicationStoredEvent> = [];
-@@ -232,10 +247,25 @@ const makeImporter = Effect.fn(function* (
+@@ -199,6 +225,9 @@ const makeImporter = Effect.fn(function* (
+       Layer.provide(
+         Layer.mergeAll(
+           sinkLayer,
++          Layer.mock(AgentSessionNativeSource.AgentSessionNativeSource)({
++            read: () => Effect.succeed(candidates[0]!),
++          }),
+           Layer.succeed(IdAllocator.IdAllocatorV2, yield* IdAllocator.IdAllocatorV2),
+           Layer.succeed(
+             ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+@@ -232,10 +261,25 @@ const makeImporter = Effect.fn(function* (
            }),
          ),
        ),
@@ -585,7 +654,7 @@ index 69026f9120..fed0d28b88 100644
 -  return { run: importer.importRecentAgentThreads({ projectId }), published };
 +  return {
 +    run: importer
-+      .importRecentAgentThreads({ projectId })
++      .importRecentAgentThreads({ projectId, ...nativeInput })
 +      .pipe(
 +        Effect.provide(
 +          Layer.mergeAll(
@@ -600,7 +669,7 @@ index 69026f9120..fed0d28b88 100644
  });
  
  it.effect(
-@@ -294,7 +324,7 @@ it.effect(
+@@ -294,7 +338,7 @@ it.effect(
            "providerThreads",
          ]);
          expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
@@ -609,7 +678,7 @@ index 69026f9120..fed0d28b88 100644
          expect(records.thread.activeProviderThreadId).toBe(records.providerThreads[0]?.id);
          expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(
            source.source.providerSessionId,
-@@ -311,6 +341,71 @@ it.effect(
+@@ -311,6 +355,71 @@ it.effect(
      }).pipe(Effect.scoped, Effect.provide(persistence)),
  );
  
@@ -681,7 +750,7 @@ index 69026f9120..fed0d28b88 100644
  it.effect("rechecks ownership after the import reaches the commit transaction", () =>
    Effect.gen(function* () {
      const enteringTransaction = yield* Deferred.make<void>();
-@@ -365,15 +460,15 @@ it.effect(
+@@ -365,15 +474,15 @@ it.effect(
        yield* sql`CREATE TEMP TRIGGER fail_runtime BEFORE INSERT ON provider_session_runtime BEGIN SELECT RAISE(ABORT, 'test runtime failure'); END`;
        expect(yield* importer.run).toEqual({ importedCount: 0, skippedCount: 1 });
        const committed = yield* events.read({ threadId }).pipe(Stream.runCollect);
@@ -700,11 +769,286 @@ index 69026f9120..fed0d28b88 100644
        expect(
          (yield* projections.getThreadRecords(threadId, ["messages"])).messages.map(
            (message) => message.text,
+@@ -386,3 +495,269 @@ it.effect(
+       });
+     }).pipe(Effect.scoped, Effect.provide(persistence)),
+ );
++
++it.effect(
++  "imports Codex native tool history, terminal statuses, turn IDs and binding idempotently",
++  () =>
++    Effect.gen(function* () {
++      const projections = yield* ProjectionStore.ProjectionStoreV2;
++      const source = candidate(CODEX_MODEL_SELECTION, "native-codex");
++      const thread = parseCodexSession(
++        {
++          id: source.source.providerSessionId,
++          cwd: "/workspace/project",
++          createdAt: 1790000000,
++          updatedAt: 1790000001,
++          turns: [
++            {
++              id: "original-turn",
++              status: "interrupted",
++              items: [
++                { id: "user", type: "userMessage", content: [{ type: "text", text: "Fix it" }] },
++                {
++                  id: "command",
++                  type: "commandExecution",
++                  command: "false",
++                  status: "failed",
++                  exitCode: 1,
++                  aggregatedOutput: "failure",
++                },
++                {
++                  id: "edit",
++                  type: "fileChange",
++                  status: "completed",
++                  changes: [
++                    { path: "a.ts", kind: { type: "add" }, diff: "+a" },
++                    { path: "b.ts", kind: { type: "delete" }, diff: "-b" },
++                  ],
++                },
++                { id: "answer", type: "agentMessage", text: "Interrupted" },
++              ],
++            },
++          ],
++        },
++        source.source.providerInstanceId,
++      );
++      const importer = yield* makeImporter([{ ...source, thread }], Effect.void, {
++        source: "codex",
++        sessionId: thread.providerSessionId,
++        providerInstanceId: thread.providerInstanceId,
++      });
++      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
++      const before = yield* projections.getThreadRecords(importId(source), [
++        "messages",
++        "turnItems",
++        "providerThreads",
++        "providerTurns",
++      ]);
++      expect(before.turnItems.find((i) => i.type === "command_execution")).toMatchObject({
++        status: "failed",
++        input: "false",
++        output: "failure",
++        exitCode: 1,
++        nativeItemRef: { nativeId: "command" },
++      });
++      expect(before.turnItems.find((i) => i.type === "file_change")).toMatchObject({
++        changes: [
++          { path: "a.ts", operation: "add" },
++          { path: "b.ts", operation: "delete" },
++        ],
++        diffStr: "+a\n-b",
++      });
++      expect(
++        before.turnItems.find((i) => i.type === "assistant_message" && i.text === "Interrupted"),
++      ).toMatchObject({ status: "interrupted" });
++      expect(before.providerTurns).toHaveLength(1);
++      expect(before.providerTurns[0]?.nativeTurnRef?.nativeId).toBe("original-turn");
++      expect(before.providerThreads[0]?.nativeThreadRef).toMatchObject({
++        strength: "strong",
++        nativeId: "native-codex",
++        driver: "codex",
++      });
++      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
++      expect(
++        yield* projections.getThreadRecords(importId(source), [
++          "messages",
++          "turnItems",
++          "providerThreads",
++          "providerTurns",
++        ]),
++      ).toEqual(before);
++    }).pipe(Effect.scoped, Effect.provide(persistence)),
++);
++
++it.effect("imports OpenCode 2 native edits and binary file attachments", () =>
++  Effect.gen(function* () {
++    const projections = yield* ProjectionStore.ProjectionStoreV2;
++    const base = candidate(CODEX_MODEL_SELECTION, "ses_example");
++    const thread = parseOpenCode2Session(
++      {
++        info: {
++          id: "ses_example",
++          location: { directory: "/workspace/project" },
++          time: { created: timestamp, updated: timestamp },
++        },
++        messages: [
++          {
++            id: "msg_u",
++            type: "user",
++            text: "Inspect the file",
++            time: { created: timestamp },
++            files: [{ name: "sample.bin", mime: "application/octet-stream", data: "AP8BAg==" }],
++          },
++          {
++            id: "msg_a",
++            type: "assistant",
++            time: { created: timestamp, completed: timestamp },
++            content: [
++              {
++                id: "tool_edit",
++                type: "tool",
++                name: "edit",
++                time: { created: timestamp, completed: timestamp },
++                state: {
++                  status: "completed",
++                  input: { filePath: "a.ts", oldString: "a", newString: "b" },
++                  metadata: { diff: "-a\n+b" },
++                  content: [{ type: "text", text: "edited" }],
++                },
++              },
++            ],
++          },
++        ],
++      },
++      ProviderInstanceId.make("opencode"),
++    );
++    const source = {
++      ...base,
++      thread,
++      source: {
++        ...base.source,
++        provider: "opencode" as const,
++        providerInstanceId: thread.providerInstanceId,
++      },
++    };
++    const importer = yield* makeImporter([source], Effect.void, {
++      source: "opencode",
++      sessionId: thread.providerSessionId,
++      providerInstanceId: thread.providerInstanceId,
++    });
++    expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
++    const records = yield* projections.getThreadRecords(importId(source), [
++      "messages",
++      "turnItems",
++      "providerThreads",
++    ]);
++    expect(records.messages[0]?.attachments[0]).toMatchObject({
++      type: "file",
++      name: "sample.bin",
++      mimeType: "application/octet-stream",
++      sizeBytes: 4,
++    });
++    expect(records.turnItems.find((i) => i.type === "file_change")).toMatchObject({
++      fileName: "a.ts",
++      oldStr: "a",
++      newStr: "b",
++      diffStr: "-a\n+b",
++    });
++    expect(records.providerThreads[0]?.nativeThreadRef).toMatchObject({
++      driver: "opencode",
++      strength: "strong",
++      nativeId: "ses_example",
++    });
++  }).pipe(Effect.scoped, Effect.provide(persistence)),
++);
++
++it.effect(
++  "persists referenced Codex local images and refuses missing images without committing history",
++  () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const config = yield* ServerConfig.ServerConfig;
++      const dir = yield* fs.makeTempDirectoryScoped();
++      const imagePath = path.join(dir, "fixture.png");
++      const png = Buffer.from(
++        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9xkAAAAASUVORK5CYII=",
++        "base64",
++      );
++      yield* fs.writeFile(imagePath, png);
++      const base = candidate(CODEX_MODEL_SELECTION, "local-images");
++      const source = {
++        ...base,
++        thread: {
++          ...base.thread,
++          messages: [
++            {
++              role: "user" as const,
++              text: "Inspect",
++              createdAt: timestamp,
++              localImages: [imagePath],
++            },
++          ],
++        },
++      };
++      const importer = yield* makeImporter([source], Effect.void, {
++        source: "codex",
++        sessionId: base.thread.providerSessionId,
++        providerInstanceId: base.thread.providerInstanceId,
++      });
++      const projections = yield* ProjectionStore.ProjectionStoreV2;
++      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
++      const records = yield* projections.getThreadRecords(importId(source), ["messages"]);
++      const attachment = records.messages[0]!.attachments[0]!;
++      expect(attachment).toMatchObject({
++        type: "image",
++        mimeType: "image/png",
++        sizeBytes: png.byteLength,
++      });
++      const persisted = yield* fs.readFile(
++        path.join(config.attachmentsDir, `${attachment.id}.png`),
++      );
++      expect(Buffer.from(persisted)).toEqual(png);
++      const missing = {
++        ...source,
++        source: { ...source.source, providerSessionId: "missing-image" },
++        thread: {
++          ...source.thread,
++          providerSessionId: "missing-image",
++          messages: [
++            { ...source.thread.messages[0]!, localImages: [path.join(dir, "missing.png")] },
++          ],
++        },
++      };
++      const failed = yield* makeImporter([missing], Effect.void, {
++        source: "codex",
++        sessionId: "missing-image",
++        providerInstanceId: base.thread.providerInstanceId,
++      });
++      expect(yield* failed.run).toEqual({ importedCount: 0, skippedCount: 1 });
++      expect(yield* Effect.option(projections.getThread(importId(missing)))).toEqual(Option.none());
++    }).pipe(Effect.scoped, Effect.provide(persistence)),
++);
++
++it.effect("limits explicit scanner imports to the selected provider and instance", () =>
++  Effect.gen(function* () {
++    const sessionId = "11111111-1111-4111-8111-111111111111";
++    const selected = candidate(CLAUDE_MODEL_SELECTION, sessionId, "claudeAgent");
++    const wrongProvider = candidate(CODEX_MODEL_SELECTION, sessionId);
++    const wrongInstance = candidate(
++      { ...CLAUDE_MODEL_SELECTION, instanceId: ProviderInstanceId.make("claude-other") },
++      sessionId,
++      "claudeAgent",
++    );
++    const importer = yield* makeImporter([selected, wrongProvider, wrongInstance], Effect.void, {
++      source: "claudeAgent",
++      sessionId,
++      providerInstanceId: selected.thread.providerInstanceId,
++    });
++    expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
++    const projections = yield* ProjectionStore.ProjectionStoreV2;
++    expect(yield* Effect.option(projections.getThread(importId(wrongProvider)))).toEqual(
++      Option.none(),
++    );
++    expect(yield* Effect.option(projections.getThread(importId(wrongInstance)))).toEqual(
++      Option.none(),
++    );
++  }).pipe(Effect.scoped, Effect.provide(persistence)),
++);
 diff --git a/apps/server/src/project/AgentSessionImporter.ts b/apps/server/src/project/AgentSessionImporter.ts
-index 11f168ff1d..150270a9e1 100644
+index 11f168ff1d..f442eec055 100644
 --- a/apps/server/src/project/AgentSessionImporter.ts
 +++ b/apps/server/src/project/AgentSessionImporter.ts
-@@ -7,34 +7,56 @@ import {
+@@ -1,3 +1,4 @@
++import { nativeToolTurnItem } from "./AgentSessionNativeProjection.ts";
+ import {
+   DEFAULT_MODEL,
+   DEFAULT_MODEL_BY_PROVIDER,
+@@ -7,35 +8,58 @@ import {
    AgentSessionImportProjectNotFoundError,
    AgentSessionImportSource,
    AgentSessionScanError,
@@ -760,9 +1104,11 @@ index 11f168ff1d..150270a9e1 100644
 +  createDeterministicAttachmentId,
 +} from "../attachmentStore.ts";
  import * as AgentSessionScanner from "./AgentSessionScanner.ts";
++import * as AgentSessionNativeSource from "./AgentSessionNativeSource.ts";
  import * as ProjectService from "./ProjectService.ts";
  
-@@ -82,14 +104,37 @@ class AgentSessionThreadModifiedError extends Schema.TaggedError<AgentSessionThr
+ const IMPORT_EVENT_PREFIX = "agent-session-import:v2";
+@@ -82,14 +106,37 @@ class AgentSessionThreadModifiedError extends Schema.TaggedError<AgentSessionThr
    }
  }
  
@@ -800,13 +1146,23 @@ index 11f168ff1d..150270a9e1 100644
  }): ReadonlyArray<OrchestrationV2DomainEvent> {
    const ordinal = input.index + 1;
    const suffix = String(input.index).padStart(6, "0");
-@@ -97,17 +142,25 @@ function messageEvents(input: {
+@@ -97,17 +144,35 @@ function messageEvents(input: {
    const turnItemId = TurnItemId.make(
      `${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`,
    );
-+  const nodeId = NodeId.make(`${input.threadId}:import-node:${suffix}`);
-+  const providerTurnId = ProviderTurnId.make(`${input.providerThreadId}:import-turn:${suffix}`);
++  const nodeId = NodeId.make(
++    input.message.sourceTurnId === undefined
++      ? `${input.threadId}:import-node:${suffix}`
++      : `${input.threadId}:native-turn-node:${input.message.sourceTurnId}`,
++  );
++  const providerTurnId = ProviderTurnId.make(
++    input.message.sourceTurnId === undefined
++      ? `${input.providerThreadId}:import-turn:${suffix}`
++      : `${input.providerThreadId}:native-turn:${input.message.sourceTurnId}`,
++  );
    const at = dateTime(input.message.createdAt);
++  const completedAt = dateTime(input.message.completedAt ?? input.message.createdAt);
++  const status = input.message.status ?? "completed";
 +  const nativeId = input.message.sourceId ?? `${input.threadId}:message:${suffix}`;
 +  const nativeRef = {
 +    driver: input.driver,
@@ -828,7 +1184,7 @@ index 11f168ff1d..150270a9e1 100644
      streaming: false,
      createdAt: at,
      updatedAt: at,
-@@ -116,10 +169,10 @@ function messageEvents(input: {
+@@ -116,17 +181,17 @@ function messageEvents(input: {
      id: turnItemId,
      threadId: input.threadId,
      runId: null,
@@ -842,8 +1198,18 @@ index 11f168ff1d..150270a9e1 100644
 +    nativeItemRef: nativeRef,
      parentItemId: null,
      ordinal,
-     status: "completed" as const,
-@@ -138,16 +191,59 @@ function messageEvents(input: {
+-    status: "completed" as const,
++    status,
+     title: null,
+     startedAt: at,
+-    completedAt: at,
+-    updatedAt: at,
++    completedAt,
++    updatedAt: completedAt,
+   };
+   const turnItem: OrchestrationV2TurnItem =
+     input.message.role === "user"
+@@ -138,16 +203,62 @@ function messageEvents(input: {
            messageId,
            inputIntent: "turn_start",
            text: input.message.text,
@@ -872,8 +1238,11 @@ index 11f168ff1d..150270a9e1 100644
 +        runId: null,
 +        parentNodeId: null,
 +        rootNodeId: nodeId,
-+        kind: input.message.role === "user" ? "root_turn" : "assistant_message",
-+        status: "completed",
++        kind:
++          input.message.sourceTurnId !== undefined || input.message.role === "user"
++            ? "root_turn"
++            : "assistant_message",
++        status,
 +        countsForRun: false,
 +        providerThreadId: input.providerThreadId,
 +        providerTurnId,
@@ -881,7 +1250,7 @@ index 11f168ff1d..150270a9e1 100644
 +        runtimeRequestId: null,
 +        checkpointScopeId: null,
 +        startedAt: at,
-+        completedAt: at,
++        completedAt,
 +      },
 +    },
 +    {
@@ -895,17 +1264,17 @@ index 11f168ff1d..150270a9e1 100644
 +        providerThreadId: input.providerThreadId,
 +        nodeId,
 +        runAttemptId: null,
-+        nativeTurnRef: nativeRef,
++        nativeTurnRef: { ...nativeRef, nativeId: input.message.sourceTurnId ?? nativeId },
 +        ordinal,
-+        status: "completed",
++        status,
 +        startedAt: at,
-+        completedAt: at,
++        completedAt,
 +      },
 +    },
      {
        id: EventId.make(`${IMPORT_EVENT_PREFIX}:message:${input.threadId}:${suffix}`),
        type: "message.updated",
-@@ -163,6 +259,223 @@ function messageEvents(input: {
+@@ -163,15 +274,337 @@ function messageEvents(input: {
        payload: turnItem,
      },
    ];
@@ -1039,7 +1408,9 @@ index 11f168ff1d..150270a9e1 100644
 +      updatedAt: activityCompletedAt,
 +    };
 +    const activityStatus =
-+      activity.kind === "tool" && activity.failed ? ("failed" as const) : ("completed" as const);
++      activity.kind === "tool"
++        ? (activity.status ?? (activity.failed ? "failed" : "completed"))
++        : "completed";
 +    const activityItemEvent = (activityItem: OrchestrationV2TurnItem) => ({
 +      id: EventId.make(
 +        `${IMPORT_EVENT_PREFIX}:activity-item-event:${input.threadId}:${suffix}:${activityIndex}`,
@@ -1066,35 +1437,39 @@ index 11f168ff1d..150270a9e1 100644
 +    const activityItem: OrchestrationV2TurnItem =
 +      activity.kind === "reasoning"
 +        ? { ...activityCommon, type: "reasoning", text: activity.text, streaming: false }
-+        : activity.claudeResult !== undefined
-+          ? claudeToolTurnItem({
-+              base: { ...activityCommon, status: activityStatus },
-+              classification: classifyClaudeNativeTool(activity.name),
-+              toolName: activity.name,
-+              toolInput: claudeNativeToolInputFromUnknown(activity.input),
-+              output: claudeTranscriptToolOutput(
-+                activity.claudeResult.content,
-+                activity.claudeResult.structuredOutput,
-+              ),
-+              presentation: mcpToolPresentation({
-+                toolName: activity.name.replace(/^mcp__claude_ai_/u, "mcp__"),
-+              }),
-+            })
-+          : importedToolIsCommand(activity.name)
-+            ? {
-+                ...activityCommon,
-+                type: "command_execution",
-+                input: importedToolInput(activity.input),
-+                ...(activity.output === null ? {} : { output: activity.output }),
-+                ...(activity.failed ? { outputIndicatesFailure: true } : {}),
-+              }
-+            : {
-+                ...activityCommon,
-+                type: "dynamic_tool",
++        : activity.native !== undefined
++          ? nativeToolTurnItem({ ...activityCommon, status: activityStatus }, activity)
++          : activity.claudeResult !== undefined
++            ? claudeToolTurnItem({
++                base: { ...activityCommon, status: activityStatus },
++                classification: classifyClaudeNativeTool(activity.name),
 +                toolName: activity.name,
-+                input: activity.input,
-+                ...(activity.output === null ? {} : { output: activity.output }),
-+              };
++                toolInput: claudeNativeToolInputFromUnknown(activity.input),
++                output: claudeTranscriptToolOutput(
++                  activity.claudeResult.content,
++                  activity.claudeResult.structuredOutput,
++                ),
++                presentation: mcpToolPresentation({
++                  toolName: activity.name.replace(/^mcp__claude_ai_/u, "mcp__"),
++                }),
++              })
++            : importedToolIsCommand(activity.name)
++              ? {
++                  ...activityCommon,
++                  status: activityStatus,
++                  type: "command_execution",
++                  input: importedToolInput(activity.input),
++                  ...(activity.output === null ? {} : { output: activity.output }),
++                  ...(activity.failed ? { outputIndicatesFailure: true } : {}),
++                }
++              : {
++                  ...activityCommon,
++                  status: activityStatus,
++                  type: "dynamic_tool",
++                  toolName: activity.name,
++                  input: activity.input,
++                  ...(activity.output === null ? {} : { output: activity.output }),
++                };
 +    events.push(
 +      {
 +        id: EventId.make(
@@ -1129,7 +1504,10 @@ index 11f168ff1d..150270a9e1 100644
  }
  
  const make = Effect.gen(function* () {
-@@ -172,6 +485,66 @@ const make = Effect.gen(function* () {
++  const native = yield* AgentSessionNativeSource.AgentSessionNativeSource;
+   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+   const orchestrator = yield* Orchestrator.OrchestratorV2;
+   const projects = yield* ProjectService.ProjectService;
    const eventSink = yield* EventSink.EventSinkV2;
    const idAllocator = yield* IdAllocator.IdAllocatorV2;
    const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
@@ -1139,14 +1517,52 @@ index 11f168ff1d..150270a9e1 100644
 +    readonly threadId: ThreadId;
 +    readonly messageId: MessageId;
 +    readonly images: ReadonlyArray<AgentSessionScanner.AgentSessionImageAttachment>;
++    readonly files: ReadonlyArray<AgentSessionScanner.AgentSessionImageAttachment>;
++    readonly localImages: ReadonlyArray<string>;
 +  }) {
-+    if (input.images.length === 0) return [];
++    if (input.images.length + input.files.length + input.localImages.length === 0) return [];
 +    const config = yield* ServerConfig.ServerConfig;
 +    const fileSystem = yield* FileSystem.FileSystem;
 +    const path = yield* Path.Path;
++    const localImages = yield* Effect.forEach(
++      input.localImages,
++      Effect.fnUntraced(function* (imagePath) {
++        const stat = yield* fileSystem.stat(imagePath);
++        if (stat.size > 10 * 1024 * 1024 || stat.type !== "File")
++          return yield* new AgentSessionAttachmentError({
++            message: "Local image is unavailable or too large.",
++          });
++        const bytes = yield* fileSystem.readFile(imagePath);
++        const mime =
++          bytes[0] === 0x89 && bytes[1] === 0x50
++            ? "image/png"
++            : bytes[0] === 0xff && bytes[1] === 0xd8
++              ? "image/jpeg"
++              : Buffer.from(bytes.subarray(0, 3)).toString() === "GIF"
++                ? "image/gif"
++                : Buffer.from(bytes.subarray(8, 12)).toString() === "WEBP"
++                  ? "image/webp"
++                  : null;
++        if (mime === null)
++          return yield* new AgentSessionAttachmentError({
++            message: "Local image has an unsupported format.",
++          });
++        return {
++          name: path.basename(imagePath),
++          mimeType: mime,
++          sizeBytes: bytes.byteLength,
++          dataUrl: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
++        };
++      }),
++    );
++    const all = [
++      ...input.images.map((image) => ({ image, type: "image" as const })),
++      ...localImages.map((image) => ({ image, type: "image" as const })),
++      ...input.files.map((image) => ({ image, type: "file" as const })),
++    ];
 +    return yield* Effect.forEach(
-+      input.images.map((image, index) => ({ image, index })),
-+      ({ image, index }) =>
++      all.map((entry, index) => ({ ...entry, index })),
++      ({ image, type, index }) =>
 +        Effect.gen(function* () {
 +          const separator = image.dataUrl.indexOf(",");
 +          const encoded = separator < 0 ? "" : image.dataUrl.slice(separator + 1);
@@ -1174,7 +1590,7 @@ index 11f168ff1d..150270a9e1 100644
 +            });
 +          }
 +          const attachment: ChatAttachment = {
-+            type: "image",
++            type,
 +            id: ChatAttachmentId.make(rawId),
 +            name: image.name,
 +            mimeType: image.mimeType,
@@ -1196,19 +1612,40 @@ index 11f168ff1d..150270a9e1 100644
    const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
      input: AgentSessionImportInput,
    ) {
-@@ -211,7 +584,10 @@ const make = Effect.gen(function* () {
+@@ -211,7 +644,31 @@ const make = Effect.gen(function* () {
        }
        return payload.value.importedTranscripts ?? [];
      });
 -    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
-+    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources, {
-+      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
-+      ...(input.includeOlder === undefined ? {} : { includeOlder: input.includeOlder }),
-+    });
++    const outcomes =
++      input.source === "codex" || input.source === "opencode"
++        ? Stream.fromEffect(
++            native
++              .read(input, project.workspaceRoot)
++              .pipe(
++                Effect.mapError(
++                  (cause) => new AgentSessionScanError({ operation: "read-native-history", cause }),
++                ),
++              ),
++          )
++        : scanner
++            .recentThreads(project.workspaceRoot, completedSources, {
++              ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
++              ...(input.includeOlder === undefined ? {} : { includeOlder: input.includeOlder }),
++            })
++            .pipe(
++              Stream.filter(
++                (outcome) =>
++                  outcome._tag === "Skipped" ||
++                  ((input.source === undefined || outcome.source.provider === input.source) &&
++                    (input.providerInstanceId === undefined ||
++                      outcome.source.providerInstanceId === input.providerInstanceId)),
++              ),
++            );
      const importedThreadIds = new Set<ThreadId>();
      let importedCount = 0;
      let skippedCount = 0;
-@@ -276,7 +652,10 @@ const make = Effect.gen(function* () {
+@@ -276,7 +733,10 @@ const make = Effect.gen(function* () {
                  actualProjectId: existing.value.thread.projectId,
                });
              }
@@ -1220,7 +1657,7 @@ index 11f168ff1d..150270a9e1 100644
                return yield* new AgentSessionThreadModifiedError({ threadId });
              }
              yield* persistRuntime;
-@@ -307,7 +686,7 @@ const make = Effect.gen(function* () {
+@@ -307,7 +767,7 @@ const make = Effect.gen(function* () {
              linkedPullRequest: null,
              branchPullRequest: null,
              activeProviderThreadId: providerThreadId,
@@ -1229,7 +1666,7 @@ index 11f168ff1d..150270a9e1 100644
              lineage: {
                parentThreadId: null,
                relationshipToParent: null,
-@@ -362,9 +741,6 @@ const make = Effect.gen(function* () {
+@@ -362,9 +822,6 @@ const make = Effect.gen(function* () {
                  occurredAt: createdAt,
                  payload: appThread,
                },
@@ -1239,7 +1676,7 @@ index 11f168ff1d..150270a9e1 100644
                {
                  id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
                  type: "provider-thread.updated",
-@@ -374,6 +750,23 @@ const make = Effect.gen(function* () {
+@@ -374,6 +831,25 @@ const make = Effect.gen(function* () {
                  occurredAt: updatedAt,
                  payload: providerThread,
                },
@@ -1248,6 +1685,8 @@ index 11f168ff1d..150270a9e1 100644
 +                  threadId,
 +                  messageId: MessageId.make(`${threadId}:${String(index).padStart(6, "0")}`),
 +                  images: message.images ?? [],
++                  files: message.files ?? [],
++                  localImages: message.localImages ?? [],
 +                }),
 +              )).flatMap((attachments, index) =>
 +                messageEvents({
@@ -1263,6 +1702,1758 @@ index 11f168ff1d..150270a9e1 100644
              ],
            });
            if (committed.length === 0) return null;
+@@ -401,7 +877,7 @@ const make = Effect.gen(function* () {
+     return { importedCount, skippedCount } satisfies AgentSessionImportResult;
+   });
+ 
+-  return { importRecentAgentThreads };
++  return { importRecentAgentThreads, listNativeSessions: native.list };
+ });
+ 
+ type AgentSessionImporterShape = Effect.Success<typeof make>;
+diff --git a/apps/server/src/project/AgentSessionNative.test.ts b/apps/server/src/project/AgentSessionNative.test.ts
+new file mode 100644
+index 0000000000..e3d078f313
+--- /dev/null
++++ b/apps/server/src/project/AgentSessionNative.test.ts
+@@ -0,0 +1,345 @@
++import { describe, expect, it } from "@effect/vitest";
++import { ProviderInstanceId } from "@t3tools/contracts";
++import { parseCodexSession, parseOpenCode2Session } from "./AgentSessionNative.ts";
++
++const instance = ProviderInstanceId.make("codex-personal");
++const created = 1_790_000_000;
++const codex = (items: ReadonlyArray<unknown>) => ({
++  id: "11111111-1111-4111-8111-111111111111",
++  cwd: "/workspace/project",
++  name: "Imported Codex",
++  createdAt: created,
++  updatedAt: created + 10,
++  status: { type: "notLoaded" },
++  turns: [{ id: "turn-1", status: "interrupted", items }],
++});
++const info = {
++  id: "ses_example",
++  title: "Imported OpenCode",
++  location: { directory: "/workspace/project" },
++  model: { providerID: "example", modelID: "model" },
++  time: { created: created * 1000, updated: (created + 10) * 1000 },
++};
++const at = { created: created * 1000, completed: (created + 1) * 1000 };
++
++describe("native provider import", () => {
++  it("preserves Codex items, native IDs, statuses, reasoning, images and collaborators", () => {
++    const thread = parseCodexSession(
++      codex([
++        {
++          id: "u1",
++          type: "userMessage",
++          content: [
++            { type: "text", text: "Fix this" },
++            { type: "image", url: "data:image/png;base64,aGVsbG8=" },
++          ],
++        },
++        {
++          id: "r1",
++          type: "reasoning",
++          summary: ["Reasoning summary"],
++          content: ["Readable reasoning"],
++        },
++        {
++          id: "cmd1",
++          type: "commandExecution",
++          command: "false",
++          status: "failed",
++          exitCode: 1,
++          aggregatedOutput: "failure",
++        },
++        {
++          id: "edit1",
++          type: "fileChange",
++          changes: [{ path: "a.ts", diff: "+hello", kind: { type: "add" } }],
++          status: "completed",
++        },
++        {
++          id: "mcp1",
++          type: "mcpToolCall",
++          server: "docs",
++          tool: "lookup",
++          arguments: { query: "x" },
++          result: { content: [{ type: "text", text: "found" }] },
++          status: "completed",
++        },
++        { id: "plan1", type: "plan", text: "Implementation plan" },
++        {
++          id: "web1",
++          type: "webSearch",
++          query: "documentation",
++          results: [{ url: "https://example.com" }],
++        },
++        {
++          id: "child1",
++          type: "collabAgentToolCall",
++          tool: "spawnAgent",
++          prompt: "Investigate",
++          receiverThreadIds: ["child-session"],
++          agentsStates: { "child-session": { status: "completed", message: "Done" } },
++          status: "completed",
++        },
++        { id: "compact1", type: "contextCompaction" },
++        { id: "a1", type: "agentMessage", text: "Stopped here" },
++      ]),
++      instance,
++    );
++    expect(thread.providerInstanceId).toBe(instance);
++    expect(thread.messages[0]?.images?.[0]?.sizeBytes).toBe(5);
++    expect(thread.messages.at(-1)).toMatchObject({
++      sourceId: "a1",
++      text: "Stopped here",
++      status: "interrupted",
++    });
++    expect(
++      thread.messages.flatMap((m) => m.activities ?? []).filter((a) => a.kind === "reasoning"),
++    ).toMatchObject([{ text: "Reasoning summary\n\nReadable reasoning" }]);
++    expect(
++      thread.messages
++        .flatMap((m) => m.activities ?? [])
++        .find((a) => a.kind === "tool" && a.id === "cmd1"),
++    ).toMatchObject({
++      status: "failed",
++      output: "failure",
++      native: { source: "codex", item: { exitCode: 1 } },
++    });
++    expect(thread.messages.flatMap((m) => m.subagents ?? [])).toMatchObject([
++      { id: "child-session", prompt: "Investigate", result: "Done", status: "completed" },
++    ]);
++    expect(
++      thread.messages.flatMap((m) => m.activities ?? []).some((a) => a.kind === "compaction"),
++    ).toBe(true);
++  });
++  it("preserves unfamiliar native Codex items instead of dropping them", () => {
++    const thread = parseCodexSession(
++      codex([{ id: "new1", type: "futureTool", payload: { answer: 42 } }]),
++      instance,
++    );
++    expect(thread.messages[0]?.activities?.[0]).toMatchObject({
++      kind: "tool",
++      native: { source: "codex", item: { type: "futureTool", payload: { answer: 42 } } },
++    });
++  });
++  it("rejects malformed identities and unloaded or partial Codex turns", () => {
++    expect(() => parseCodexSession({ ...codex([]), id: "" }, instance)).toThrow();
++    expect(() =>
++      parseCodexSession(
++        { ...codex([]), turns: [{ id: "t", itemsView: "summary", items: [] }] },
++        instance,
++      ),
++    ).toThrow();
++  });
++  it("preserves OpenCode 2 text, tool metadata, files, shell, compaction and control messages", () => {
++    const thread = parseOpenCode2Session(
++      {
++        info,
++        messages: [
++          {
++            id: "msg_u",
++            type: "user",
++            text: "Fix this",
++            files: [{ data: "aGVsbG8=", mime: "image/png", source: { type: "inline" } }],
++            time: at,
++          },
++          {
++            id: "msg_a",
++            type: "assistant",
++            time: at,
++            content: [
++              { type: "reasoning", text: "Consider the failure" },
++              {
++                id: "tool_1",
++                type: "tool",
++                name: "edit",
++                time: at,
++                state: {
++                  status: "completed",
++                  input: { filePath: "a.ts", oldString: "a", newString: "b" },
++                  content: [{ type: "text", text: "updated" }],
++                  metadata: { diff: "-a\n+b" },
++                },
++              },
++              { type: "text", text: "Done" },
++            ],
++          },
++          {
++            id: "msg_shell",
++            type: "shell",
++            command: "false",
++            status: "failed",
++            exit: 1,
++            output: "failure",
++            time: at,
++          },
++          {
++            id: "msg_compact",
++            type: "compaction",
++            status: "completed",
++            summary: "Retained summary",
++            recent: "Recent work",
++            time: at,
++          },
++          {
++            id: "msg_model",
++            type: "model-switched",
++            model: { providerID: "example", modelID: "model-2" },
++            time: at,
++          },
++        ],
++      },
++      ProviderInstanceId.make("opencode"),
++    );
++    expect(thread.source).toBe("opencode");
++    expect(thread.model).toBe("example/model");
++    expect(thread.messages[0]?.images?.[0]?.sizeBytes).toBe(5);
++    expect(
++      thread.messages
++        .flatMap((m) => m.activities ?? [])
++        .find((a) => a.kind === "tool" && a.id === "tool_1"),
++    ).toMatchObject({
++      native: { source: "opencode", item: { state: { metadata: { diff: "-a\n+b" } } } },
++    });
++    expect(thread.messages.find((m) => m.sourceId === "msg_compact")?.text).toContain(
++      "Retained summary",
++    );
++    expect(thread.messages.find((m) => m.sourceId === "msg_model")?.text).toContain("model-2");
++  });
++  it("respects an OpenCode revert boundary and rejects OpenCode 1 exports", () => {
++    const snapshot = {
++      info: { ...info, revert: { messageID: "msg_reverted" } },
++      messages: [
++        { id: "msg_keep", type: "user", text: "Keep", time: at },
++        { id: "msg_reverted", type: "user", text: "Discard", time: at },
++        {
++          id: "msg_discard",
++          type: "assistant",
++          content: [{ type: "text", text: "Discard" }],
++          time: at,
++        },
++      ],
++    };
++    expect(
++      parseOpenCode2Session(snapshot, ProviderInstanceId.make("opencode")).messages.map(
++        (m) => m.text,
++      ),
++    ).toEqual(["Keep"]);
++    expect(() =>
++      parseOpenCode2Session(
++        { info: { ...info, directory: "/workspace/project", location: undefined }, messages: [] },
++        instance,
++      ),
++    ).toThrow();
++  });
++});
++
++it("retains OpenCode tool file bytes and Codex tool images as attachments", () => {
++  const opencode = parseOpenCode2Session(
++    {
++      info,
++      messages: [
++        {
++          id: "msg_files",
++          type: "assistant",
++          time: at,
++          content: [
++            {
++              id: "tool_file",
++              type: "tool",
++              name: "read",
++              time: at,
++              state: {
++                status: "completed",
++                input: {},
++                content: [
++                  {
++                    type: "file",
++                    uri: "data:application/octet-stream;base64,AP8=",
++                    mime: "application/octet-stream",
++                    name: "result.bin",
++                  },
++                ],
++              },
++            },
++          ],
++        },
++      ],
++    },
++    instance,
++  );
++  expect(opencode.messages[0]?.files?.[0]).toMatchObject({
++    name: "result.bin",
++    sizeBytes: 2,
++    dataUrl: "data:application/octet-stream;base64,AP8=",
++  });
++  const codexThread = parseCodexSession(
++    codex([
++      {
++        id: "image_tool",
++        type: "mcpToolCall",
++        server: "images",
++        tool: "get",
++        result: { content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] },
++      },
++    ]),
++    instance,
++  );
++  expect(codexThread.messages[0]?.images?.[0]?.sizeBytes).toBe(5);
++});
++
++it("groups OpenCode steered prompts until the native idle boundary", () => {
++  const thread = parseOpenCode2Session(
++    {
++      info,
++      messages: [
++        { id: "msg_first", type: "user", text: "Start", time: at },
++        { id: "msg_steer", type: "user", text: "Also check", time: at },
++        { id: "msg_idle", type: "idle", outcome: "interrupted", time: at },
++        { id: "msg_next", type: "user", text: "Continue", time: at },
++      ],
++    },
++    instance,
++  );
++  expect(thread.messages.map((m) => m.sourceTurnId)).toEqual([
++    "msg_first",
++    "msg_first",
++    "msg_first",
++    "msg_next",
++  ]);
++  expect(thread.messages[2]?.status).toBe("interrupted");
++});
++
++it("preserves native terminal errors even without a visible assistant answer", () => {
++  const failed = parseCodexSession(
++    {
++      ...codex([]),
++      turns: [
++        {
++          id: "failed-turn",
++          status: "failed",
++          items: [],
++          error: { message: "Synthetic provider failure" },
++        },
++      ],
++    },
++    instance,
++  );
++  expect(failed.messages[0]).toMatchObject({ status: "failed", sourceTurnId: "failed-turn" });
++  expect(failed.messages[0]?.text).toContain("Synthetic provider failure");
++  const partial = parseOpenCode2Session(
++    {
++      info,
++      messages: [
++        {
++          id: "msg_error",
++          type: "assistant",
++          time: at,
++          content: [{ type: "text", text: "Partial answer" }],
++          error: { message: "Synthetic interruption" },
++        },
++      ],
++    },
++    instance,
++  );
++  expect(partial.messages.at(-1)).toMatchObject({ status: "failed" });
++  expect(partial.messages.at(-1)?.text).toContain("Synthetic interruption");
++});
+diff --git a/apps/server/src/project/AgentSessionNative.ts b/apps/server/src/project/AgentSessionNative.ts
+new file mode 100644
+index 0000000000..bc78d099f2
+--- /dev/null
++++ b/apps/server/src/project/AgentSessionNative.ts
+@@ -0,0 +1,470 @@
++import type { ProviderInstanceId } from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import type {
++  AgentSessionActivity,
++  AgentSessionImageAttachment,
++  AgentSessionSubagentActivity,
++  AgentSessionThread,
++  AgentSessionThreadMessage,
++} from "./AgentSessionScanner.ts";
++
++export const record = (value: unknown): Readonly<Record<string, unknown>> =>
++  typeof value === "object" && value !== null && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : {};
++export const array = (value: unknown): ReadonlyArray<unknown> =>
++  Array.isArray(value) ? value : [];
++export const string = (value: unknown): string => (typeof value === "string" ? value : "");
++const required = (value: unknown, field: string) => {
++  const text = string(value);
++  if (!text.trim()) throw new Error(`Native session is missing ${field}.`);
++  return text;
++};
++const iso = (value: unknown, fallback: string, seconds = false): string => {
++  if (DateTime.isDateTime(value)) return DateTime.formatIso(value);
++  if (value === null || value === undefined) return fallback;
++  const millis =
++    typeof value === "number" ? value * (seconds ? 1000 : 1) : Date.parse(string(value));
++  if (!Number.isFinite(millis)) throw new Error("Native session has an invalid timestamp.");
++  return DateTime.formatIso(DateTime.makeUnsafe(millis));
++};
++const epoch = "1970-01-01T00:00:00.000Z";
++const statusOf = (value: unknown): NonNullable<AgentSessionThreadMessage["status"]> => {
++  switch (value) {
++    case "failed":
++    case "errored":
++    case "notFound":
++    case "timeout":
++    case "error":
++      return "failed";
++    case "interrupted":
++    case "inProgress":
++    case "running":
++    case "streaming":
++    case "shutdown":
++    case "spawned":
++    case "killed":
++    case "pending":
++      return "interrupted";
++    case "declined":
++    case "cancelled":
++    case "canceled":
++      return "cancelled";
++    default:
++      return "completed";
++  }
++};
++const modelOf = (value: unknown): string | null => {
++  if (typeof value === "string") return value;
++  const model = record(value);
++  return model.modelID ? `${string(model.providerID)}/${string(model.modelID)}` : null;
++};
++const textOf = (value: unknown): string => {
++  if (typeof value === "string") return value;
++  return array(value)
++    .map((entry) => {
++      if (typeof entry === "string") return entry;
++      const part = record(entry);
++      if (part.type === "file")
++        return `[File: ${string(part.name) || string(part.mime)}${string(part.uri).startsWith("data:") ? "" : ` ${string(part.uri)}`}]`;
++      return string(part.text);
++    })
++    .filter(Boolean)
++    .join("\n");
++};
++function image(url: unknown, name: string): AgentSessionImageAttachment | undefined {
++  const match = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$/i.exec(string(url));
++  if (!match) return undefined;
++  const encoded = match[2]!;
++  return {
++    name,
++    mimeType: match[1]!,
++    sizeBytes: Buffer.from(encoded, "base64").byteLength,
++    dataUrl: string(url),
++  };
++}
++function contentAttachments(value: unknown) {
++  const images: Array<AgentSessionImageAttachment> = [];
++  const files: Array<AgentSessionImageAttachment> = [];
++  for (const entry of array(value)) {
++    const part = record(entry);
++    const mime = string(part.mime ?? part.mimeType) || "application/octet-stream";
++    const uri =
++      string(part.uri ?? part.url ?? part.imageUrl) ||
++      (part.data ? `data:${mime};base64,${string(part.data)}` : "");
++    const match = /^data:([^;,]+);base64,([A-Za-z0-9+/]+={0,2})$/i.exec(uri);
++    if (!match) continue;
++    const attachment = {
++      name: string(part.name) || "attachment",
++      mimeType: match[1]!,
++      sizeBytes: Buffer.from(match[2]!, "base64").byteLength,
++      dataUrl: uri,
++    };
++    if (attachment.mimeType.startsWith("image/")) images.push(attachment);
++    else files.push(attachment);
++  }
++  return { images, files };
++}
++const tool = (
++  source: "codex" | "opencode",
++  item: Readonly<Record<string, unknown>>,
++  createdAt: string,
++  completedAt: string,
++): AgentSessionActivity => {
++  const state = source === "opencode" ? record(item.state) : item;
++  const status = statusOf(state.status ?? (state.error ? "failed" : "completed"));
++  return {
++    kind: "tool",
++    id: required(item.id, "tool ID"),
++    name: string(item.name ?? item.tool ?? item.type) || "Tool",
++    input: state.input ?? item.arguments ?? item,
++    output:
++      string(item.aggregatedOutput) ||
++      textOf(state.content) ||
++      textOf(record(item.result).content) ||
++      string(record(state.error).message) ||
++      null,
++    failed: status === "failed",
++    status,
++    createdAt,
++    completedAt,
++    native: { source, item },
++  };
++};
++
++export function parseCodexSession(
++  value: unknown,
++  providerInstanceId: ProviderInstanceId,
++): AgentSessionThread {
++  const thread = record(value);
++  const id = required(thread.id, "Codex thread ID");
++  required(thread.cwd, "Codex workspace");
++  if (!Array.isArray(thread.turns)) throw new Error("Codex turn history was not loaded.");
++  const createdAt = iso(thread.createdAt, epoch, true);
++  const updatedAt = iso(thread.updatedAt, createdAt, true);
++  const messages: Array<AgentSessionThreadMessage> = [];
++  let model = modelOf(thread.model);
++  for (const rawTurn of thread.turns) {
++    const turn = record(rawTurn);
++    if (
++      turn.itemsView === "summary" ||
++      turn.itemsView === "notLoaded" ||
++      !Array.isArray(turn.items)
++    )
++      throw new Error("Codex turn items were not fully loaded.");
++    const started = iso(turn.startedAt, createdAt, true);
++    const completed = iso(turn.completedAt, started, true);
++    model = modelOf(turn.model) ?? model;
++    for (const rawItem of turn.items) {
++      const item = record(rawItem);
++      const sourceId = required(item.id, "Codex item ID");
++      const common = {
++        sourceId,
++        sourceTurnId: required(turn.id, "Codex turn ID"),
++        createdAt: started,
++        completedAt: completed,
++        status: statusOf(turn.status),
++      };
++      if (item.type === "userMessage") {
++        const images: Array<AgentSessionImageAttachment> = [];
++        const localImages: Array<string> = [];
++        const text: Array<string> = [];
++        for (const rawContent of array(item.content)) {
++          const content = record(rawContent);
++          if (content.type === "text") text.push(string(content.text));
++          else if (content.type === "localImage")
++            localImages.push(required(content.path, "image path"));
++          else if (content.type === "image") {
++            const inline = image(content.url, `image-${images.length + 1}`);
++            if (inline) images.push(inline);
++            else text.push(`[Image: ${string(content.url)}]`);
++          } else text.push(JSON.stringify(content));
++        }
++        messages.push({
++          ...common,
++          role: "user",
++          text: text.join("\n"),
++          images,
++          localImages,
++          status: "completed",
++        });
++      } else if (item.type === "agentMessage") {
++        messages.push({ ...common, role: "assistant", text: string(item.text) });
++      } else if (item.type === "reasoning") {
++        const text = [
++          ...new Set([textOf(item.summary), textOf(item.content)].filter(Boolean)),
++        ].join("\n\n");
++        messages.push({
++          ...common,
++          role: "assistant",
++          text: "",
++          activities: [{ kind: "reasoning", text, createdAt: started }],
++        });
++      } else if (item.type === "contextCompaction") {
++        messages.push({
++          ...common,
++          role: "assistant",
++          text: "",
++          activities: [{ kind: "compaction", createdAt: started }],
++        });
++      } else {
++        const subagents: Array<AgentSessionSubagentActivity> = [];
++        if (item.type === "collabAgentToolCall") {
++          for (const child of array(item.receiverThreadIds)) {
++            const state = record(record(item.agentsStates)[string(child)]);
++            const status = statusOf(state.status ?? item.status);
++            subagents.push({
++              id: required(child, "Codex child thread ID"),
++              prompt: string(item.prompt),
++              title: string(item.tool),
++              result: string(state.message) || null,
++              status: status === "cancelled" ? "interrupted" : status,
++              createdAt: started,
++              completedAt: completed,
++            });
++          }
++        }
++        const attachments = contentAttachments([
++          ...array(record(item.result).content),
++          ...array(item.contentItems),
++        ]);
++        const localImages: Array<string> = [];
++        if (item.type === "imageView") localImages.push(required(item.path, "viewed image path"));
++        if (item.type === "imageGeneration" && string(item.result)) {
++          const result = string(item.result);
++          const inline = image(
++            result.startsWith("data:") ? result : `data:image/png;base64,${result}`,
++            "generated-image",
++          );
++          if (inline) attachments.images.push(inline);
++        }
++        messages.push({
++          ...common,
++          role: "assistant",
++          text: "",
++          ...attachments,
++          localImages,
++          subagents,
++          activities: [tool("codex", item, started, completed)],
++        });
++      }
++    }
++    if (turn.error || turn.items.length === 0) {
++      const sourceTurnId = required(turn.id, "Codex turn ID");
++      messages.push({
++        sourceId: `${sourceTurnId}:terminal`,
++        sourceTurnId,
++        role: "assistant",
++        text: turn.error ? JSON.stringify(turn.error) : `[Native turn ${string(turn.status)}]`,
++        status: statusOf(turn.status),
++        createdAt: started,
++        completedAt: completed,
++      });
++    }
++  }
++  return {
++    source: "codex",
++    providerInstanceId,
++    providerSessionId: id,
++    title: string(thread.name) || string(thread.preview).slice(0, 100) || "Imported Codex session",
++    model,
++    createdAt,
++    updatedAt,
++    messages,
++  };
++}
++
++export function parseOpenCode2Session(
++  value: unknown,
++  providerInstanceId: ProviderInstanceId,
++): AgentSessionThread {
++  const snapshot = record(value);
++  const info = record(snapshot.info);
++  const id = required(info.id, "OpenCode session ID");
++  required(record(info.location).directory, "OpenCode 2 location");
++  if (!id.startsWith("ses_") || !Array.isArray(snapshot.messages))
++    throw new Error("Not an OpenCode 2 session export.");
++  const createdAt = iso(record(info.time).created, epoch);
++  const updatedAt = iso(record(info.time).updated, createdAt);
++  const messages: Array<AgentSessionThreadMessage> = [];
++  const boundary = string(record(info.revert).messageID);
++  if (boundary && !snapshot.messages.some((m) => record(m).id === boundary))
++    throw new Error("OpenCode revert boundary is missing from the export.");
++  let nativeTurnId: string | undefined;
++  for (const rawMessage of snapshot.messages) {
++    const message = record(rawMessage);
++    const sourceId = required(message.id, "OpenCode message ID");
++    if (boundary && sourceId === boundary) break;
++    const started = iso(record(message.time).created, createdAt);
++    const completed = iso(record(message.time).completed, started);
++    nativeTurnId ??= sourceId;
++    const common = {
++      sourceId,
++      sourceTurnId: nativeTurnId,
++      createdAt: started,
++      completedAt: completed,
++      status: statusOf(
++        message.error ||
++          (message.type === "shell" &&
++            message.status === "exited" &&
++            typeof message.exit === "number" &&
++            message.exit !== 0)
++          ? "failed"
++          : (message.status ?? message.outcome),
++      ),
++    };
++    if (message.type === "user") {
++      const images: Array<AgentSessionImageAttachment> = [];
++      const files: Array<AgentSessionImageAttachment> = [];
++      for (const rawFile of array(message.files)) {
++        const file = record(rawFile);
++        const mime = string(file.mime) || "application/octet-stream";
++        if (mime.startsWith("image/")) {
++          const inline = image(
++            `data:${mime};base64,${string(file.data)}`,
++            string(file.name) || `image-${images.length + 1}`,
++          );
++          if (inline) images.push(inline);
++        } else
++          files.push({
++            name: string(file.name) || "attachment",
++            mimeType: mime,
++            sizeBytes: Buffer.from(string(file.data), "base64").byteLength,
++            dataUrl: `data:${mime};base64,${string(file.data)}`,
++          });
++      }
++      messages.push({ ...common, role: "user", text: string(message.text), images, files });
++    } else if (message.type === "assistant") {
++      if (array(message.content).length === 0)
++        messages.push({
++          ...common,
++          role: "assistant",
++          text: string(record(message.error).message) || JSON.stringify(message.error ?? message),
++        });
++      // Preserve block order: a provider message may interleave text, reasoning and tools.
++      for (const [index, rawContent] of array(message.content).entries()) {
++        const content = record(rawContent);
++        const part = { ...common, sourceId: `${sourceId}:${string(content.id) || index}` };
++        if (content.type === "text")
++          messages.push({ ...part, role: "assistant", text: string(content.text) });
++        else if (content.type === "reasoning")
++          messages.push({
++            ...part,
++            role: "assistant",
++            text: "",
++            activities: [
++              {
++                kind: "reasoning",
++                text: string(content.text),
++                createdAt: iso(record(content.time).created, started),
++              },
++            ],
++          });
++        else if (content.type === "tool") {
++          const activity = tool(
++            "opencode",
++            content,
++            iso(record(content.time).created, started),
++            iso(record(content.time).completed, completed),
++          );
++          const metadata = record(record(content.state).metadata);
++          const child = string(metadata.sessionID ?? metadata.childID);
++          const subagents: ReadonlyArray<AgentSessionSubagentActivity> = child
++            ? [
++                {
++                  id: child,
++                  prompt: string(record(record(content.state).input).prompt),
++                  title: string(content.name),
++                  status: activity.kind === "tool" && activity.failed ? "failed" : "completed",
++                  result: activity.kind === "tool" ? activity.output : null,
++                  createdAt: started,
++                  completedAt: completed,
++                },
++              ]
++            : [];
++          messages.push({
++            ...part,
++            role: "assistant",
++            text: "",
++            ...contentAttachments(record(content.state).content),
++            activities: [activity],
++            subagents,
++          });
++        } else
++          messages.push({
++            ...part,
++            role: "assistant",
++            text: "",
++            activities: [tool("opencode", { ...content, id: part.sourceId }, started, completed)],
++          });
++      }
++      if (message.error && array(message.content).length > 0)
++        messages.push({
++          ...common,
++          sourceId: `${sourceId}:error`,
++          role: "assistant",
++          text: JSON.stringify(message.error),
++        });
++    } else if (message.type === "shell") {
++      messages.push({
++        ...common,
++        role: "user",
++        text: "",
++        activities: [
++          tool(
++            "opencode",
++            {
++              ...message,
++              name: "bash",
++              state: {
++                status:
++                  message.status === "exited" &&
++                  typeof message.exit === "number" &&
++                  message.exit !== 0
++                    ? "failed"
++                    : message.status,
++                input: { command: message.command },
++                content: [
++                  {
++                    type: "text",
++                    text: string(message.output) || string(record(message.output).output),
++                  },
++                ],
++                metadata: { exit: message.exit },
++              },
++            },
++            started,
++            completed,
++          ),
++        ],
++      });
++    } else if (message.type === "compaction") {
++      messages.push({
++        ...common,
++        role: "assistant",
++        text: [
++          string(message.summary),
++          string(message.recent),
++          message.error ? JSON.stringify(message.error) : "",
++        ]
++          .filter(Boolean)
++          .join("\n\n"),
++        activities: [{ kind: "compaction", createdAt: started }],
++      });
++    } else {
++      const text = string(message.text) || string(message.description) || JSON.stringify(message);
++      messages.push({ ...common, role: "assistant", text });
++    }
++    if (message.type === "idle") nativeTurnId = undefined;
++  }
++  return {
++    source: "opencode",
++    providerInstanceId,
++    providerSessionId: id,
++    title: string(info.title) || "Imported OpenCode session",
++    model: modelOf(info.model),
++    createdAt,
++    updatedAt,
++    messages,
++  };
++}
+diff --git a/apps/server/src/project/AgentSessionNativeProjection.ts b/apps/server/src/project/AgentSessionNativeProjection.ts
+new file mode 100644
+index 0000000000..0387e22d6c
+--- /dev/null
++++ b/apps/server/src/project/AgentSessionNativeProjection.ts
+@@ -0,0 +1,93 @@
++import { PlanId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
++import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
++import { openCodeToolTurnItem } from "@t3tools/provider-opencode/server/toolItems";
++import type { AgentSessionActivity } from "./AgentSessionScanner.ts";
++import { array, record, string } from "./AgentSessionNative.ts";
++
++type Base = Omit<
++  Extract<OrchestrationV2TurnItem, { type: "dynamic_tool" }>,
++  "type" | "toolName" | "input" | "output"
++>;
++export function nativeToolTurnItem(
++  base: Base,
++  activity: Extract<AgentSessionActivity, { kind: "tool" }>,
++): OrchestrationV2TurnItem {
++  const native = activity.native!;
++  const item = native.item;
++  if (native.source === "opencode") {
++    const state = record(item.state);
++    const projected = openCodeToolTurnItem(base, {
++      name: activity.name,
++      input: { ...record(state.input) },
++      output: activity.output ?? undefined,
++      completedMetadata: state.metadata,
++    });
++    return projected.type === "dynamic_tool"
++      ? { ...projected, output: JSON.stringify(item) }
++      : projected;
++  }
++  switch (item.type) {
++    case "plan":
++      return {
++        ...base,
++        type: "proposed_plan",
++        planId: PlanId.make(`${base.id}:plan`),
++        markdown: string(item.text),
++        streaming: false,
++      };
++    case "commandExecution":
++      return {
++        ...base,
++        type: "command_execution",
++        input: string(item.command),
++        ...(activity.output === null ? {} : { output: activity.output }),
++        ...(typeof item.exitCode === "number" ? { exitCode: item.exitCode } : {}),
++        ...(activity.failed ? { outputIndicatesFailure: true } : {}),
++      };
++    case "fileChange": {
++      const changes = array(item.changes).map(record);
++      return {
++        ...base,
++        type: "file_change",
++        fileName: string(changes[0]?.path) || "File changes",
++        diffStr: changes.map((change) => string(change.diff)).join("\n"),
++        changes: changes.map((change) => ({
++          operation: string(record(change.kind).type) || "update",
++          path: string(change.path) || "unknown",
++          ...(string(record(change.kind).move_path)
++            ? { oldPath: string(change.path), path: string(record(change.kind).move_path) }
++            : {}),
++        })),
++      };
++    }
++    case "webSearch":
++      return {
++        ...base,
++        type: "web_search",
++        patterns: [string(item.query)].filter(Boolean),
++        results: array(item.results).map((value) => {
++          const result = record(value);
++          return {
++            title: string(result.title),
++            ...(string(result.url) ? { url: string(result.url) } : {}),
++            snippet: string(result.snippet),
++          };
++        }),
++      };
++    // Keep the entire native record for less common and future tools. No input/output is silently dropped.
++    default:
++      return {
++        ...base,
++        type: "dynamic_tool",
++        ...(item.type === "mcpToolCall"
++          ? mcpToolPresentation({ toolName: item.tool, serverName: item.server })
++          : {}),
++        toolName:
++          item.type === "mcpToolCall"
++            ? `${string(item.server)}/${string(item.tool)}`
++            : activity.name,
++        input: activity.input,
++        output: JSON.stringify(item),
++      };
++  }
++}
+diff --git a/apps/server/src/project/AgentSessionNativeSource.test.ts b/apps/server/src/project/AgentSessionNativeSource.test.ts
+new file mode 100644
+index 0000000000..1da2b1ed1c
+--- /dev/null
++++ b/apps/server/src/project/AgentSessionNativeSource.test.ts
+@@ -0,0 +1,299 @@
++import { expect, it } from "@effect/vitest";
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { ProjectId, ProviderInstanceId, ProviderDriverKind } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as ServerSettings from "../serverSettings.ts";
++import * as Source from "./AgentSessionNativeSource.ts";
++import * as Transport from "./AgentSessionNativeTransport.ts";
++
++const projectId = ProjectId.make("project");
++const instanceId = ProviderInstanceId.make("codex-personal");
++const thread = {
++  id: "native-thread",
++  cwd: "/workspace/project",
++  status: { type: "idle" },
++  createdAt: 1790000000,
++  updatedAt: 1790000001,
++  historyMode: "paginated",
++  turns: [],
++};
++const turn = (id: string) => ({
++  id,
++  status: "completed",
++  itemsView: "full",
++  items: [{ id: `item-${id}`, type: "agentMessage", text: id }],
++});
++const layer = (request: Transport.NativeHistoryClient["request"]) =>
++  Source.layer.pipe(
++    Layer.provide(
++      Layer.succeed(Transport.AgentSessionNativeTransport, {
++        withClient: (_instance, _directory, use) => use({ request }),
++      }),
++    ),
++    Layer.provide(
++      ServerSettings.layerTest({
++        providerInstances: {
++          [instanceId]: { driver: ProviderDriverKind.make("codex"), enabled: true },
++          [ProviderInstanceId.make("opencode")]: {
++            driver: ProviderDriverKind.make("opencode"),
++            enabled: true,
++          },
++        },
++      }),
++    ),
++    Layer.provide(NodeServices.layer),
++  );
++const input = {
++  projectId,
++  source: "codex" as const,
++  providerInstanceId: instanceId,
++  sessionId: thread.id,
++};
++
++it.effect(
++  "reads all Codex pages, retains native binding and produces a stable ledger identity",
++  () => {
++    const calls: Array<Readonly<Record<string, unknown>>> = [];
++    return Effect.gen(function* () {
++      const source = yield* Source.AgentSessionNativeSource;
++      const first = yield* source.read(input, thread.cwd);
++      const second = yield* source.read(input, thread.cwd);
++      expect(first).toEqual(second);
++      expect(first.thread.messages.map((m) => m.text)).toEqual(["t1", "t2"]);
++      expect(first.thread.providerInstanceId).toBe(instanceId);
++      expect(first.source.filePath).toMatch(/^native:\/\/codex\/codex-personal\//);
++      expect(calls.filter((p) => p.cursor === "page-2")).toHaveLength(4);
++    }).pipe(
++      Effect.provide(
++        layer((method, params) => {
++          calls.push(params);
++          return Effect.succeed(
++            method === "thread/read"
++              ? { thread }
++              : {
++                  data: [turn(params.cursor ? "t2" : "t1")],
++                  nextCursor: params.cursor ? null : "page-2",
++                },
++          );
++        }),
++      ),
++    );
++  },
++);
++it.effect("rejects a repeated pagination cursor instead of truncating", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    expect(yield* Effect.flip(source.read(input, thread.cwd))).toMatchObject({
++      reason: "protocol",
++    });
++  }).pipe(
++    Effect.provide(
++      layer((method) =>
++        Effect.succeed(
++          method === "thread/read" ? { thread } : { data: [turn("t1")], nextCursor: "repeat" },
++        ),
++      ),
++    ),
++  ),
++);
++it.effect("rejects active Codex threads before reading turn pages", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    expect(yield* Effect.flip(source.read(input, thread.cwd))).toMatchObject({ reason: "active" });
++  }).pipe(
++    Effect.provide(
++      layer(() => Effect.succeed({ thread: { ...thread, status: { type: "active" } } })),
++    ),
++  ),
++);
++it.effect("rejects provider instance mismatch", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    expect(
++      yield* Effect.flip(source.read({ ...input, source: "opencode" }, thread.cwd)),
++    ).toMatchObject({ reason: "configuration" });
++  }).pipe(Effect.provide(layer(() => Effect.die("Transport must not be reached")))),
++);
++it.effect("rejects a workspace mismatch", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    expect(yield* Effect.flip(source.read(input, "/workspace/other"))).toMatchObject({
++      reason: "identity",
++    });
++  }).pipe(
++    Effect.provide(
++      layer((method) =>
++        Effect.succeed(
++          method === "thread/read" ? { thread } : { data: [turn("t1")], nextCursor: null },
++        ),
++      ),
++    ),
++  ),
++);
++it.effect("rejects Codex history that changes while reading", () => {
++  let reads = 0;
++  return Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    expect(yield* Effect.flip(source.read(input, thread.cwd))).toMatchObject({ reason: "changed" });
++  }).pipe(
++    Effect.provide(
++      layer((method) =>
++        Effect.sync(() =>
++          method === "thread/read"
++            ? { thread: { ...thread, updatedAt: thread.updatedAt + reads++ } }
++            : { data: [turn("t1")], nextCursor: null },
++        ),
++      ),
++    ),
++  );
++});
++it.effect("lists both current and archived Codex sessions without exposing config", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    const result = yield* source.list({ source: "codex", providerInstanceId: instanceId });
++    expect(result.sessions.map((s) => s.sessionId)).toEqual(["archived", "native-thread"]);
++    expect(Object.keys(result.sessions[0]!)).toEqual([
++      "source",
++      "providerInstanceId",
++      "sessionId",
++      "workspaceRoot",
++      "title",
++      "updatedAt",
++    ]);
++  }).pipe(
++    Effect.provide(
++      layer((_method, params) =>
++        Effect.succeed({
++          data: [
++            {
++              ...thread,
++              ...(params.archived ? { id: "archived", updatedAt: thread.updatedAt + 1 } : {}),
++            },
++          ],
++          nextCursor: null,
++        }),
++      ),
++    ),
++  ),
++);
++
++const info = {
++  id: "ses_example",
++  title: "OpenCode 2",
++  location: { directory: thread.cwd },
++  time: { created: "2026-09-01T10:00:00.000Z", updated: "2026-09-01T10:01:00.000Z" },
++};
++const snapshot = {
++  info,
++  messages: [{ id: "msg_u", type: "user", text: "hello", time: info.time }],
++};
++const openInput = { projectId, source: "opencode" as const, sessionId: info.id };
++it.effect("imports a stable OpenCode 2 export with native instance and ID", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    const result = yield* source.read(openInput, thread.cwd);
++    expect(result.thread).toMatchObject({
++      source: "opencode",
++      providerSessionId: info.id,
++      providerInstanceId: "opencode",
++      messages: [{ text: "hello" }],
++    });
++  }).pipe(
++    Effect.provide(
++      layer((method) => Effect.succeed(method === "active" ? { data: {} } : snapshot)),
++    ),
++  ),
++);
++it.effect("rejects active OpenCode sessions", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    expect(yield* Effect.flip(source.read(openInput, thread.cwd))).toMatchObject({
++      reason: "active",
++    });
++  }).pipe(
++    Effect.provide(layer(() => Effect.succeed({ data: { [info.id]: { type: "running" } } }))),
++  ),
++);
++it.effect("rejects changed OpenCode exports", () => {
++  let reads = 0;
++  return Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    expect(yield* Effect.flip(source.read(openInput, thread.cwd))).toMatchObject({
++      reason: "changed",
++    });
++  }).pipe(
++    Effect.provide(
++      layer((method) =>
++        Effect.succeed(method === "active" ? { data: {} } : { ...snapshot, revision: reads++ }),
++      ),
++    ),
++  );
++});
++
++it.effect("hydrates paginated OpenCode shell output before projecting it", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    const result = yield* source.read(openInput, thread.cwd);
++    expect(result.thread.messages[0]?.activities?.[0]).toMatchObject({
++      kind: "tool",
++      output: "abcdef",
++      status: "failed",
++    });
++  }).pipe(
++    Effect.provide(
++      layer((method, params) =>
++        Effect.succeed(
++          method === "active"
++            ? { data: {} }
++            : method === "shellOutput"
++              ? {
++                  data: {
++                    output: params.cursor === 0 ? "abc" : "def",
++                    cursor: params.cursor === 0 ? 3 : 6,
++                    size: 6,
++                    truncated: params.cursor === 0,
++                  },
++                }
++              : {
++                  info,
++                  messages: [
++                    {
++                      id: "msg_shell",
++                      shellID: "sh_fixture",
++                      type: "shell",
++                      command: "false",
++                      status: "exited",
++                      exit: 1,
++                      time: { created: info.time.created, completed: info.time.updated },
++                      output: { output: "def", cursor: 6, size: 6, truncated: true },
++                    },
++                  ],
++                },
++        ),
++      ),
++    ),
++  ),
++);
++
++it.effect("uses the implicit default Codex instance on a fresh T3 installation", () =>
++  Effect.gen(function* () {
++    const source = yield* Source.AgentSessionNativeSource;
++    expect(yield* source.list({ source: "codex" })).toEqual({ sessions: [] });
++  }).pipe(
++    Effect.provide(
++      Source.layer.pipe(
++        Layer.provide(
++          Layer.succeed(Transport.AgentSessionNativeTransport, {
++            withClient: (instance, _directory, use) => {
++              expect(instance.driver).toBe("codex");
++              return use({ request: () => Effect.succeed({ data: [], nextCursor: null }) });
++            },
++          }),
++        ),
++        Layer.provide(ServerSettings.layerTest({ providerInstances: {} })),
++        Layer.provide(NodeServices.layer),
++      ),
++    ),
++  ),
++);
+diff --git a/apps/server/src/project/AgentSessionNativeSource.ts b/apps/server/src/project/AgentSessionNativeSource.ts
+new file mode 100644
+index 0000000000..7001ea9132
+--- /dev/null
++++ b/apps/server/src/project/AgentSessionNativeSource.ts
+@@ -0,0 +1,322 @@
++import * as Crypto from "effect/Crypto";
++import {
++  ProviderInstanceId,
++  ProviderDriverKind,
++  resolveProviderInstanceEnabled,
++  type AgentSessionImportInput,
++  type AgentSessionListInput,
++  type AgentSessionListResult,
++  type ProviderInstanceConfig,
++} from "@t3tools/contracts";
++import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
++import * as Context from "effect/Context";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as ServerSettings from "../serverSettings.ts";
++import {
++  array,
++  record,
++  string,
++  parseCodexSession,
++  parseOpenCode2Session,
++} from "./AgentSessionNative.ts";
++import * as Transport from "./AgentSessionNativeTransport.ts";
++import type { AgentSessionRecentThread } from "./AgentSessionScanner.ts";
++
++const MAX_BYTES = 512 * 1024 * 1024;
++const MAX_RECORDS = 100_000;
++const MAX_PAGES = 1000;
++const fail = (reason: Transport.NativeHistoryError["reason"]) =>
++  new Transport.NativeHistoryError({ reason });
++const encoded = (value: unknown) => JSON.stringify(value);
++function timestamp(value: unknown): string {
++  if (DateTime.isDateTime(value)) return DateTime.formatIso(value);
++  return DateTime.formatIso(
++    DateTime.makeUnsafe(typeof value === "number" ? value * 1000 : string(value)),
++  );
++}
++const active = (value: unknown) =>
++  ["active", "inProgress", "running", "streaming", "pending"].includes(string(value));
++function assertIdle(value: unknown, codex: boolean) {
++  const snapshot = record(value);
++  if (codex) {
++    if (
++      active(record(snapshot.status).type) ||
++      array(snapshot.turns).some((t) => active(record(t).status))
++    )
++      throw fail("active");
++  } else {
++    for (const raw of array(snapshot.messages)) {
++      const message = record(raw);
++      if (
++        active(message.status) ||
++        array(message.content).some((c) => active(record(record(c).state).status))
++      )
++        throw fail("active");
++      if (message.type === "assistant" && !record(message.time).completed && !message.error)
++        throw fail("active");
++    }
++  }
++}
++
++const make = Effect.gen(function* () {
++  const crypto = yield* Crypto.Crypto;
++  const transport = yield* Transport.AgentSessionNativeTransport;
++  const settings = yield* ServerSettings.ServerSettingsService;
++  const resolveInstance = Effect.fn("AgentSessionNativeSource.resolveInstance")(function* (
++    input: AgentSessionListInput,
++  ) {
++    const all = (yield* settings.getSettings).providerInstances;
++    const instanceId = input.providerInstanceId ?? ProviderInstanceId.make(input.source);
++    const instance: ProviderInstanceConfig | undefined =
++      all[instanceId] ??
++      (instanceId === input.source && !Object.hasOwn(all, input.source)
++        ? { driver: ProviderDriverKind.make(input.source) }
++        : undefined);
++    if (!instance || instance.driver !== input.source || !resolveProviderInstanceEnabled(instance))
++      return yield* fail("configuration");
++    return { instanceId, instance };
++  });
++  const pages = Effect.fn("AgentSessionNativeSource.pages")(function* (
++    client: Transport.NativeHistoryClient,
++    method: string,
++    params: Readonly<Record<string, unknown>>,
++    codex: boolean,
++  ) {
++    const entries: Array<unknown> = [];
++    const cursors = new Set<string>();
++    let cursor: string | undefined;
++    let size = 0;
++    for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber++) {
++      const page = record(
++        yield* client.request(method, { ...params, ...(cursor ? { cursor } : {}) }),
++      );
++      if (!Array.isArray(page.data)) return yield* fail("protocol");
++      size += Buffer.byteLength(encoded(page));
++      if (entries.length + page.data.length > MAX_RECORDS) return yield* fail("limit");
++      entries.push(...page.data);
++      if (entries.length > MAX_RECORDS || size > MAX_BYTES) return yield* fail("limit");
++      const next = codex ? page.nextCursor : record(page.cursor).next;
++      if (next === null || next === undefined || next === "") return entries;
++      if (typeof next !== "string" || cursors.has(next)) return yield* fail("protocol");
++      cursors.add(next);
++      cursor = next;
++    }
++    return yield* fail("limit");
++  });
++  const list = Effect.fn("AgentSessionNativeSource.list")(function* (input: AgentSessionListInput) {
++    const { instanceId, instance } = yield* resolveInstance(input);
++    return yield* transport.withClient(instance, undefined, (client) =>
++      Effect.gen(function* () {
++        const codex = input.source === "codex";
++        const rows = codex
++          ? [
++              ...(yield* pages(client, "thread/list", { limit: 100, archived: false }, true)),
++              ...(yield* pages(client, "thread/list", { limit: 100, archived: true }, true)),
++            ]
++          : yield* pages(client, "list", {}, false);
++        const sessions: AgentSessionListResult["sessions"][number][] = [];
++        const ids = new Set<string>();
++        for (const row of rows) {
++          const entry = record(row);
++          const id = string(entry.id);
++          const workspaceRoot = string(codex ? entry.cwd : record(entry.location).directory);
++          if (!id || !workspaceRoot || ids.has(id)) continue;
++          ids.add(id);
++          sessions.push({
++            source: input.source,
++            providerInstanceId: instanceId,
++            sessionId: id,
++            workspaceRoot,
++            title: string(entry.name ?? entry.title ?? entry.preview),
++            updatedAt: timestamp(codex ? entry.updatedAt : record(entry.time).updated),
++          });
++        }
++        return {
++          sessions: sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
++        } satisfies AgentSessionListResult;
++      }),
++    );
++  });
++  const read = Effect.fn("AgentSessionNativeSource.read")(function* (
++    input: AgentSessionImportInput,
++    workspace: string,
++  ) {
++    if ((input.source !== "codex" && input.source !== "opencode") || !input.sessionId)
++      return yield* fail("configuration");
++    const source = input.source;
++    const { instanceId, instance } = yield* resolveInstance({
++      source,
++      ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
++    });
++    return yield* transport.withClient(instance, workspace, (client) =>
++      Effect.gen(function* () {
++        const codex = source === "codex";
++        let snapshot: Readonly<Record<string, unknown>>;
++        if (codex) {
++          const before = record(
++            record(
++              yield* client.request("thread/read", {
++                threadId: input.sessionId,
++                includeTurns: true,
++              }),
++            ).thread,
++          );
++          yield* Effect.try({
++            try: () => assertIdle(before, true),
++            catch: (cause) => (Transport.isNativeHistoryError(cause) ? cause : fail("protocol")),
++          });
++          const turns =
++            before.historyMode === "paginated" ||
++            array(before.turns).some(
++              (t) => record(t).itemsView === "summary" || record(t).itemsView === "notLoaded",
++            )
++              ? yield* pages(
++                  client,
++                  "thread/turns/list",
++                  {
++                    threadId: input.sessionId,
++                    limit: 100,
++                    sortDirection: "asc",
++                    itemsView: "full",
++                  },
++                  true,
++                )
++              : before.turns;
++          const after = record(
++            record(
++              yield* client.request("thread/read", {
++                threadId: input.sessionId,
++                includeTurns: true,
++              }),
++            ).thread,
++          );
++          if (
++            before.id !== after.id ||
++            before.cwd !== after.cwd ||
++            before.updatedAt !== after.updatedAt ||
++            encoded(before.status) !== encoded(after.status)
++          )
++            return yield* fail("changed");
++          const paginated =
++            before.historyMode === "paginated" ||
++            array(before.turns).some(
++              (t) => record(t).itemsView === "summary" || record(t).itemsView === "notLoaded",
++            );
++          const latestTurns = paginated
++            ? yield* pages(
++                client,
++                "thread/turns/list",
++                { threadId: input.sessionId, limit: 100, sortDirection: "asc", itemsView: "full" },
++                true,
++              )
++            : after.turns;
++          if (encoded(turns) !== encoded(latestTurns)) return yield* fail("changed");
++          snapshot = { ...before, turns };
++        } else {
++          const running = record(record(yield* client.request("active", {})).data);
++          if (running[input.sessionId!]) return yield* fail("active");
++          snapshot = record(yield* client.request("read", { sessionId: input.sessionId }));
++          const after = yield* client.request("read", { sessionId: input.sessionId });
++          if (encoded(snapshot) !== encoded(after)) return yield* fail("changed");
++          const latest = record(record(yield* client.request("active", {})).data);
++          if (latest[input.sessionId!]) return yield* fail("active");
++        }
++        if (!codex) {
++          const messages: Array<unknown> = [];
++          for (const raw of array(snapshot.messages)) {
++            const message = record(raw);
++            const output = record(message.output);
++            if (
++              message.type !== "shell" ||
++              !(output.truncated || Number(output.cursor) < Number(output.size))
++            ) {
++              messages.push(raw);
++              continue;
++            }
++            let cursor = 0;
++            let text = "";
++            let complete = false;
++            for (let page = 0; page < MAX_PAGES; page++) {
++              const chunk = record(
++                record(
++                  yield* client.request("shellOutput", {
++                    shellId: message.shellID,
++                    directory: workspace,
++                    cursor,
++                  }),
++                ).data,
++              );
++              if (
++                typeof chunk.cursor !== "number" ||
++                chunk.cursor <= cursor ||
++                chunk.size !== output.size ||
++                typeof chunk.output !== "string"
++              )
++                return yield* fail("protocol");
++              cursor = chunk.cursor;
++              text += chunk.output;
++              if (Buffer.byteLength(text) > MAX_BYTES) return yield* fail("limit");
++              if (cursor === chunk.size) {
++                complete = true;
++                break;
++              }
++            }
++            if (!complete) return yield* fail("limit");
++            messages.push({
++              ...message,
++              output: { output: text, size: output.size, cursor, truncated: false },
++            });
++          }
++          snapshot = { ...snapshot, messages };
++        }
++        const info = codex ? snapshot : record(snapshot.info);
++        const cwd = string(codex ? info.cwd : record(info.location).directory);
++        if (
++          info.id !== input.sessionId ||
++          normalizeProjectPathForComparison(cwd) !== normalizeProjectPathForComparison(workspace)
++        )
++          return yield* fail("identity");
++        const json = encoded(snapshot);
++        if (Buffer.byteLength(json) > MAX_BYTES) return yield* fail("limit");
++        const thread = yield* Effect.try({
++          try: () => {
++            assertIdle(snapshot, codex);
++            return codex
++              ? parseCodexSession(snapshot, instanceId)
++              : parseOpenCode2Session(snapshot, instanceId);
++          },
++          catch: (cause) =>
++            Transport.isNativeHistoryError(cause)
++              ? cause
++              : new Transport.NativeHistoryError({ reason: "protocol", cause }),
++        });
++        if (thread.messages.length > MAX_RECORDS) return yield* fail("limit");
++        const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(json));
++        const outcome: Extract<AgentSessionRecentThread, { _tag: "Importable" }> = {
++          _tag: "Importable",
++          thread,
++          source: {
++            provider: source,
++            providerInstanceId: instanceId,
++            providerSessionId: input.sessionId!,
++            filePath: `native://${source}/${instanceId}/${encodeURIComponent(input.sessionId!)}/${Buffer.from(digest).toString("hex")}`,
++            size: Buffer.byteLength(json),
++            mtimeMs: Date.parse(thread.updatedAt),
++            birthtimeMs: Date.parse(thread.createdAt),
++            device: 0,
++            inode: null,
++          },
++        };
++        return outcome;
++      }),
++    );
++  });
++  return { list, read };
++});
++export class AgentSessionNativeSource extends Context.Service<
++  AgentSessionNativeSource,
++  Effect.Success<typeof make>
++>()("t3/project/AgentSessionNativeSource") {}
++export const layer = Layer.effect(AgentSessionNativeSource, make);
+diff --git a/apps/server/src/project/AgentSessionNativeTransport.ts b/apps/server/src/project/AgentSessionNativeTransport.ts
+new file mode 100644
+index 0000000000..f8039d8756
+--- /dev/null
++++ b/apps/server/src/project/AgentSessionNativeTransport.ts
+@@ -0,0 +1,178 @@
++import { CodexSettings, type ProviderInstanceConfig } from "@t3tools/contracts";
++import { OpenCodeSettings } from "@t3tools/provider-opencode/settings";
++import * as OpenCode2Client from "@t3tools/provider-opencode/server/v2/OpenCode2Client";
++import * as OpenCode2Server from "@t3tools/provider-opencode/server/v2/OpenCode2Server";
++import * as OpenCodeRuntime from "@t3tools/provider-opencode/server/OpenCodeRuntime";
++import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
++import * as HostProcess from "@t3tools/shared/HostProcess";
++import * as Crypto from "effect/Crypto";
++import * as FileSystem from "effect/FileSystem";
++import * as Context from "effect/Context";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++import * as HttpClient from "effect/http/HttpClient";
++import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
++import * as CodexClient from "effect-codex-app-server/client";
++import { AgentScope } from "@t3tools/shared/AgentScope";
++import { makeCodexAppServerSpawnCommand } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
++import { codexAppServerArgs, resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
++import {
++  materializeCodexShadowHome,
++  resolveCodexHomeLayout,
++} from "../provider/Drivers/CodexHomeLayout.ts";
++import { string } from "./AgentSessionNative.ts";
++
++export class NativeHistoryError extends Schema.TaggedError<NativeHistoryError>()(
++  "NativeHistoryError",
++  {
++    reason: Schema.Literals([
++      "configuration",
++      "protocol",
++      "active",
++      "changed",
++      "identity",
++      "limit",
++      "attachment",
++    ]),
++    cause: Schema.optional(Schema.Defect()),
++  },
++) {
++  override get message() {
++    return `Native history import failed (${this.reason}). Close the source session and check the selected provider instance and workspace.`;
++  }
++}
++
++export const isNativeHistoryError = Schema.is(NativeHistoryError);
++const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
++const decodeOpenCodeSettings = Schema.decodeEffect(OpenCodeSettings);
++
++export interface NativeHistoryClient {
++  readonly request: (
++    method: string,
++    params: Readonly<Record<string, unknown>>,
++  ) => Effect.Effect<unknown, NativeHistoryError>;
++}
++export class AgentSessionNativeTransport extends Context.Service<
++  AgentSessionNativeTransport,
++  {
++    readonly withClient: <A, E>(
++      instance: ProviderInstanceConfig,
++      directory: string | undefined,
++      use: (client: NativeHistoryClient) => Effect.Effect<A, E>,
++    ) => Effect.Effect<A, E | NativeHistoryError>;
++  }
++>()("t3/project/AgentSessionNativeTransport") {}
++
++const make = Effect.gen(function* () {
++  const crypto = yield* Crypto.Crypto;
++  const fs = yield* FileSystem.FileSystem;
++  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++  const host = yield* HostProcess.Environment;
++  const home = yield* HostProcess.HomeDirectory;
++  const path = yield* Path.Path;
++  const agentScope = yield* AgentScope;
++  const http = yield* HttpClient.HttpClient;
++  const runtime = yield* OpenCodeRuntime.OpenCodeRuntime;
++  return AgentSessionNativeTransport.of({
++    withClient: Effect.fn("AgentSessionNativeTransport.withClient")(
++      function* (instance, directory, use) {
++        const environment = {
++          ...host,
++          ...Object.fromEntries((instance.environment ?? []).map((v) => [v.name, v.value])),
++        };
++        const connect = Effect.gen(function* () {
++          if (instance.driver === "codex") {
++            const config = yield* decodeCodexSettings(instance.config ?? {});
++            const layout = yield* resolveCodexHomeLayout({
++              ...config,
++              homePath: config.homePath || environment.CODEX_HOME || "",
++            });
++            yield* materializeCodexShadowHome(layout);
++            const command = yield* makeCodexAppServerSpawnCommand({
++              command: expandHomePath(config.binaryPath || "codex", home),
++              args: codexAppServerArgs(resolveCodexLaunchArgs(config.launchArgs, environment)),
++              env: {
++                ...environment,
++                ...(layout.effectiveHomePath ? { CODEX_HOME: layout.effectiveHomePath } : {}),
++              },
++            });
++            const handle = yield* spawner.spawn(command);
++            const context = yield* Layer.build(CodexClient.layerChildProcess(handle));
++            const client = Context.get(context, CodexClient.CodexAppServerClient);
++            yield* client.request("initialize", {
++              clientInfo: { name: "t3-import", title: "T3 Import", version: "0.1.0" },
++              capabilities: { experimentalApi: true, optOutNotificationMethods: null },
++            });
++            yield* client.notify("initialized", undefined);
++            return yield* use({
++              request: (method, params) =>
++                client.raw
++                  .request(method, params)
++                  .pipe(
++                    Effect.mapError(
++                      (cause) => new NativeHistoryError({ reason: "protocol", cause }),
++                    ),
++                  ),
++            });
++          }
++          const config = yield* decodeOpenCodeSettings(instance.config ?? {});
++          const server = yield* OpenCode2Server.make({
++            binaryPath: expandHomePath(config.binaryPath || "opencode", home),
++            serverUrl: config.serverUrl,
++            serverPassword: config.serverPassword,
++            directory: directory ?? home,
++            environment,
++          });
++          return yield* server.withConnection(({ client }) =>
++            use({
++              request: (method, params) => {
++                const sessionID = string(params.sessionId);
++                return Effect.gen(function* () {
++                  if (method === "list")
++                    return yield* client.session.list({
++                      ...(params.cursor ? { cursor: params.cursor as never } : {}),
++                      limit: 100,
++                    });
++                  if (method === "active") return { data: yield* client.session.active() };
++                  if (method === "read")
++                    return yield* client.session.export({
++                      sessionID: sessionID as never,
++                      sanitize: false,
++                    });
++                  if (method === "shellOutput")
++                    return yield* client.shell.output({
++                      id: string(params.shellId) as never,
++                      location: { directory: string(params.directory) },
++                      cursor: Number(params.cursor),
++                      limit: 65536,
++                    });
++                  return yield* new NativeHistoryError({ reason: "protocol" });
++                }).pipe(
++                  Effect.mapError((cause) => new NativeHistoryError({ reason: "protocol", cause })),
++                );
++              },
++            }),
++          );
++        });
++        return yield* connect.pipe(
++          Effect.provideService(Path.Path, path),
++          Effect.provideService(AgentScope, agentScope),
++          Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, runtime),
++          Effect.provide(OpenCode2Client.layer),
++          Effect.provideService(HttpClient.HttpClient, http),
++          Effect.provideService(Crypto.Crypto, crypto),
++          Effect.provideService(FileSystem.FileSystem, fs),
++          Effect.scoped,
++          Effect.mapError((cause) =>
++            isNativeHistoryError(cause)
++              ? cause
++              : new NativeHistoryError({ reason: "configuration", cause }),
++          ),
++        );
++      },
++    ),
++  });
++});
++export const layer = Layer.effect(AgentSessionNativeTransport, make);
 diff --git a/apps/server/src/project/AgentSessionScanner.test.ts b/apps/server/src/project/AgentSessionScanner.test.ts
 index baf0f27f9e..301130c9f6 100644
 --- a/apps/server/src/project/AgentSessionScanner.test.ts
@@ -1599,7 +3790,7 @@ index baf0f27f9e..301130c9f6 100644
      const canonicalPrompt = "\n  Keep the canonical prompt  \n";
      const canonicalTimestamp = "2026-08-24T10:01:00.000Z";
 diff --git a/apps/server/src/project/AgentSessionScanner.ts b/apps/server/src/project/AgentSessionScanner.ts
-index 9c26b187a5..c8c722e965 100644
+index 9c26b187a5..5be2854220 100644
 --- a/apps/server/src/project/AgentSessionScanner.ts
 +++ b/apps/server/src/project/AgentSessionScanner.ts
 @@ -57,13 +57,33 @@ const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
@@ -1669,7 +3860,7 @@ index 9c26b187a5..c8c722e965 100644
        message: Schema.optional(Schema.String),
        model: Schema.optional(Schema.String),
        cwd: Schema.optional(Schema.String),
-@@ -116,14 +147,59 @@ interface AgentSessionTranscriptMetadata {
+@@ -116,14 +147,69 @@ interface AgentSessionTranscriptMetadata {
    readonly providerInstanceId: ProviderInstanceId;
    readonly fallbackSessionId: string;
    readonly lastActiveAtMs: number;
@@ -1681,6 +3872,11 @@ index 9c26b187a5..c8c722e965 100644
    readonly text: string;
    readonly createdAt: string;
 +  readonly sourceId?: string;
++  readonly status?: "completed" | "failed" | "interrupted" | "cancelled";
++  readonly completedAt?: string;
++  readonly sourceTurnId?: string;
++  readonly files?: ReadonlyArray<AgentSessionImageAttachment>;
++  readonly localImages?: ReadonlyArray<string>;
 +  readonly images?: ReadonlyArray<AgentSessionImageAttachment>;
 +  readonly subagents?: ReadonlyArray<AgentSessionSubagentActivity>;
 +  readonly activities?: ReadonlyArray<AgentSessionActivity>;
@@ -1724,12 +3920,17 @@ index 9c26b187a5..c8c722e965 100644
 +      readonly completedAt: string;
 +      // Claude's raw result, rendered through the live adapter's tool presentation.
 +      readonly claudeResult?: { readonly content: unknown; readonly structuredOutput: unknown };
++      readonly status?: "completed" | "failed" | "interrupted" | "cancelled";
++      readonly native?: {
++        readonly source: "codex" | "opencode";
++        readonly item: Readonly<Record<string, unknown>>;
++      };
 +    };
 +
  export interface AgentSessionThread {
    readonly source: AgentSessionSource;
    readonly providerInstanceId: ProviderInstanceId;
-@@ -152,6 +228,7 @@ export class AgentSessionScanner extends Context.Service<
+@@ -152,6 +238,7 @@ export class AgentSessionScanner extends Context.Service<
      readonly recentThreads: (
        workspaceRoot: string,
        completedSources?: ReadonlyArray<AgentSessionImportSource>,
@@ -1737,7 +3938,7 @@ index 9c26b187a5..c8c722e965 100644
      ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
    }
  >()("t3/project/AgentSessionScanner") {}
-@@ -225,6 +302,60 @@ function extractText(
+@@ -225,6 +312,60 @@ function extractText(
      .join("\n");
  }
  
@@ -1798,7 +3999,7 @@ index 9c26b187a5..c8c722e965 100644
  function normalizeTimestamp(value: string | undefined, fallback: string): string {
    if (value === undefined) return fallback;
    const parsed = DateTime.make(value);
-@@ -253,6 +384,7 @@ interface ClaudeFields {
+@@ -253,6 +394,7 @@ interface ClaudeFields {
    readonly title: string | undefined;
    readonly customTitle: string | null;
    readonly model: string | undefined;
@@ -1806,7 +4007,7 @@ index 9c26b187a5..c8c722e965 100644
  }
  
  const emptyClaudeFields: ClaudeFields = {
-@@ -260,6 +392,7 @@ const emptyClaudeFields: ClaudeFields = {
+@@ -260,6 +402,7 @@ const emptyClaudeFields: ClaudeFields = {
    title: undefined,
    customTitle: null,
    model: undefined,
@@ -1814,7 +4015,7 @@ index 9c26b187a5..c8c722e965 100644
  };
  
  function foldClaudeFields(fields: ClaudeFields, record: DecodedTranscriptRecord): ClaudeFields {
-@@ -274,6 +407,10 @@ function foldClaudeFields(fields: ClaudeFields, record: DecodedTranscriptRecord)
+@@ -274,6 +417,10 @@ function foldClaudeFields(fields: ClaudeFields, record: DecodedTranscriptRecord)
      // Claude uses this sentinel for local error responses. It is not a
      // model ID that can be selected when the imported session resumes.
      model: model && model !== "<synthetic>" ? model : fields.model,
@@ -1825,7 +4026,7 @@ index 9c26b187a5..c8c722e965 100644
    };
  }
  
-@@ -295,18 +432,150 @@ export function parseAgentSessionTranscript(
+@@ -295,18 +442,150 @@ export function parseAgentSessionTranscript(
  ): AgentSessionThread | null {
    if (lines.length > MAX_IMPORT_RECORDS) return null;
    const records = lines.flatMap((line) => Option.toArray(decodeTranscriptRecord(line)));
@@ -1981,7 +4182,7 @@ index 9c26b187a5..c8c722e965 100644
    const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
    // Claude filenames are session IDs. Codex rollout filenames include extra
    // timestamp text, so only transcript metadata can provide a resumable ID.
-@@ -383,7 +652,7 @@ function parseAgentSessionRecords(
+@@ -383,7 +662,7 @@ function parseAgentSessionRecords(
        derivedTitle = deriveTitle(input.source, message.text);
      }
      messages.push(message);
@@ -1990,7 +4191,7 @@ index 9c26b187a5..c8c722e965 100644
    };
  
    const hasMatchingCodexEventInTurn = (text: string) => {
-@@ -402,23 +671,194 @@ function parseAgentSessionRecords(
+@@ -402,23 +681,194 @@ function parseAgentSessionRecords(
      return false;
    };
  
@@ -2187,7 +4388,7 @@ index 9c26b187a5..c8c722e965 100644
      if (record.type === "session_meta") {
        const sessionId = record.payload?.id?.trim() || record.payload?.session_id?.trim();
        if (!hasCodexSessionId && sessionId) {
-@@ -484,7 +924,7 @@ function parseAgentSessionRecords(
+@@ -484,7 +934,7 @@ function parseAgentSessionRecords(
    const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
    const retainedMessages = firstUserMessageRetained
      ? visibleMessages
@@ -2196,7 +4397,7 @@ index 9c26b187a5..c8c722e965 100644
  
    return {
      source: input.source,
-@@ -516,7 +956,16 @@ function shouldRetainDecodedRecord(
+@@ -516,7 +966,16 @@ function shouldRetainDecodedRecord(
        ? content.trim().length > 0
        : (content?.some(
            (block) => isTextContentBlock(block) && (block.text?.trim().length ?? 0) > 0,
@@ -2214,7 +4415,7 @@ index 9c26b187a5..c8c722e965 100644
    }
    if (extractDecodedCwd(record) !== null) return true;
    return (
-@@ -525,7 +974,12 @@ function shouldRetainDecodedRecord(
+@@ -525,7 +984,12 @@ function shouldRetainDecodedRecord(
      (record.type === "event_msg" && record.payload?.type === "user_message") ||
      (record.type === "response_item" &&
        record.payload?.type === "message" &&
@@ -2228,7 +4429,7 @@ index 9c26b187a5..c8c722e965 100644
    );
  }
  
-@@ -810,6 +1264,7 @@ export const make = Effect.gen(function* () {
+@@ -810,6 +1274,7 @@ export const make = Effect.gen(function* () {
      expected: ReturnType<typeof transcriptIdentity>,
      recordLimit: number,
      source: AgentSessionSource,
@@ -2236,7 +4437,7 @@ index 9c26b187a5..c8c722e965 100644
    ) {
      if (expected.size > MAX_IMPORTED_TRANSCRIPT_BYTES) return null;
  
-@@ -821,17 +1276,19 @@ export const make = Effect.gen(function* () {
+@@ -821,17 +1286,19 @@ export const make = Effect.gen(function* () {
                return null;
              }
              const records: Array<DecodedTranscriptRecord> = [];
@@ -2258,7 +4459,7 @@ index 9c26b187a5..c8c722e965 100644
                  );
                }
              };
-@@ -848,8 +1305,22 @@ export const make = Effect.gen(function* () {
+@@ -848,8 +1315,22 @@ export const make = Effect.gen(function* () {
                  if (Option.isNone(cwd)) cwd = Option.fromNullOr(extractDecodedCwd(decoded.value));
                  if (source === "claudeAgent") {
                    claudeFields = foldClaudeFields(claudeFields, decoded.value);
@@ -2282,7 +4483,7 @@ index 9c26b187a5..c8c722e965 100644
                    records.push(decoded.value);
                    historyBytes += recordBytes;
                  }
-@@ -888,7 +1359,7 @@ export const make = Effect.gen(function* () {
+@@ -888,7 +1369,7 @@ export const make = Effect.gen(function* () {
  
              if (recordStarted && !(yield* Effect.try(finishRecord))) return null;
              return sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))
@@ -2291,7 +4492,7 @@ index 9c26b187a5..c8c722e965 100644
                : null;
            }),
          ),
-@@ -1305,6 +1776,7 @@ export const make = Effect.gen(function* () {
+@@ -1305,6 +1786,7 @@ export const make = Effect.gen(function* () {
    const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
      workspaceRoot: string,
      completedSources: ReadonlyArray<AgentSessionImportSource>,
@@ -2299,7 +4500,7 @@ index 9c26b187a5..c8c722e965 100644
    ) {
      const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
      const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
-@@ -1313,7 +1785,10 @@ export const make = Effect.gen(function* () {
+@@ -1313,7 +1795,10 @@ export const make = Effect.gen(function* () {
      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
      const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
  
@@ -2311,7 +4512,7 @@ index 9c26b187a5..c8c722e965 100644
      cachedCandidates = candidates;
  
      const eligibleTranscripts: Array<{
-@@ -1327,9 +1802,15 @@ export const make = Effect.gen(function* () {
+@@ -1327,9 +1812,15 @@ export const make = Effect.gen(function* () {
        if ((yield* directoryIdentity(resolved)) !== rootIdentity) continue;
  
        for (const transcript of candidate.transcripts) {
@@ -2328,7 +4529,7 @@ index 9c26b187a5..c8c722e965 100644
            transcript.mtimeMs > nowMs
          ) {
            continue;
-@@ -1355,7 +1836,8 @@ export const make = Effect.gen(function* () {
+@@ -1355,7 +1846,8 @@ export const make = Effect.gen(function* () {
      const importedSessions = new Set<string>();
      let bytesRemaining = MAX_IMPORT_BYTES;
      let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
@@ -2338,7 +4539,7 @@ index 9c26b187a5..c8c722e965 100644
      return Stream.fromIteratorSucceed(eligibleTranscripts.values(), 1).pipe(
        Stream.mapEffect(({ candidate, transcript }) =>
          Effect.gen(function* () {
-@@ -1378,6 +1860,8 @@ export const make = Effect.gen(function* () {
+@@ -1378,6 +1870,8 @@ export const make = Effect.gen(function* () {
                source.provider === candidate.source && sameTranscriptIdentity(source, identity),
            );
            if (completedSource !== undefined) {
@@ -2347,7 +4548,7 @@ index 9c26b187a5..c8c722e965 100644
              const sessionKey = `${completedSource.providerInstanceId}\0${completedSource.providerSessionId}`;
              if (importedSessions.has(sessionKey)) return Option.none<AgentSessionRecentThread>();
              importedSessions.add(sessionKey);
-@@ -1401,6 +1885,7 @@ export const make = Effect.gen(function* () {
+@@ -1401,6 +1895,7 @@ export const make = Effect.gen(function* () {
              identity,
              recordsRemaining,
              candidate.source,
@@ -2355,7 +4556,7 @@ index 9c26b187a5..c8c722e965 100644
            );
            if (snapshot === null) {
              return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
-@@ -1424,14 +1909,19 @@ export const make = Effect.gen(function* () {
+@@ -1424,14 +1919,19 @@ export const make = Effect.gen(function* () {
                providerInstanceId: candidate.providerInstanceId,
                fallbackSessionId: path.basename(transcript.filePath, ".jsonl"),
                lastActiveAtMs: transcript.mtimeMs,
@@ -2375,7 +4576,7 @@ index 9c26b187a5..c8c722e965 100644
            const source: AgentSessionImportSource = {
              ...identity,
              provider: parsedThread.source,
-@@ -1458,7 +1948,8 @@ export const make = Effect.gen(function* () {
+@@ -1458,7 +1958,8 @@ export const make = Effect.gen(function* () {
    const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
      workspaceRoot,
      completedSources = [],
@@ -2407,32 +4608,33 @@ index f461a99186..00234a17c9 100644
        Layer.provide(ServerHttp.layerServerEnvironmentHttpApi),
 diff --git a/docs/internals/agent-session-import.md b/docs/internals/agent-session-import.md
 new file mode 100644
-index 0000000000..41e4f95f9d
+index 0000000000..1665efc664
 --- /dev/null
 +++ b/docs/internals/agent-session-import.md
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,75 @@
 +# Native agent-session import fidelity
 +
 +The session importer is deliberately a **native import**, not a legacy T3 database
 +migration. It writes current v2 events and binds the imported provider thread to the
-+original Claude or Codex native session.
++original Claude, Codex, or OpenCode native session.
 +
 +## Fidelity contract
 +
-+| Area | Current behavior | Evidence / boundary |
-+| --- | --- | --- |
-+| Native continuation | Claude imports keep `nativeThreadRef` and resume that session on the first follow-up. | On 2026-10-29, a copied 364 MB real session recalled an earlier conversation topic without tools. After restarting the built server, it recalled a different earlier discussion. Both protocol opens used `resume`, not `sessionId`. An exact `RESUME_OK` response alone does not establish retained context. |
-+| Legacy handoff avoidance | Native imports use `historyOrigin: "native"`; `"v1_import"` would make the orchestrator create a legacy context handoff. | The first real continuation test failed through the handoff budget; changing the origin made direct native resume pass. |
-+| Visible messages | User and assistant text is imported into current v2 message and turn-item events. | Scanner/importer tests and isolated projection. |
-+| Claude branch | Only the current branch is imported. It is found on a parent graph of every main-chain record, because real sessions link prompts and replies through attachment, hook, and timing records the importer does not retain. The leaf is the latest visible message at or after Claude's `last-prompt` marker. | A walk over retained records alone stopped after 2–3 records on real sessions and fell back to the whole file, mixing abandoned branches in. The 364 MB session now imports its full 732-prompt branch. |
-+| Provider turns/nodes | Historical provider turns and execution nodes are emitted with weak native item refs. | Isolated Claude projection: 9,780 nodes for the 364 MB session. |
-+| Claude images | Inline base64 Claude images are persisted under T3’s attachment store with deterministic IDs and attached to imported messages. | Target transcript produced 51 persisted image files / 51 unique attachment payloads. Remote image URLs are not downloaded. |
-+| Claude subagents | Native `Agent`/`Task` calls produce subagent nodes, subagent projections, and subagent turn items with prompt/result/status/native task refs. | Target projection produced 24 subagents and 24 subagent turn items. |
-+| Claude reasoning/tools | Thinking blocks become reasoning items. Tool calls go through the live adapter's `claudeToolTurnItem` with the transcript's structured `toolUseResult`, so they render as live Claude tools do: command, file change, web search, or MCP-branded dynamic tool. Tool results are deduplicated by tool ID while reading large transcripts. | Importer test; target projection produced 2,654 command, 243 file change, 29 web search, and 304 dynamic tool items. |
-+| Claude compaction | Compact boundaries on the branch reconnect through `logicalParentUuid` (only toward an older record) and become `compaction` items on the next imported message. | Scanner test; 13 of 13 boundaries in the target session. |
-+| Codex tools | `custom_tool_call`/`function_call` and corresponding output records become tool activities and current T3 tool items. | Synthetic Codex fixture coverage. |
-+| Idempotency | Re-importing an unchanged source is recognized as already imported; event IDs and attachment IDs are deterministic. | Importer tests and repeated isolated imports. |
-+| Restart durability | v2 projection, provider binding, subagents, turns, and attachments survive server restart. | Isolated restart query verified provider native ID, 2,335 turns, nodes, and attachments. |
++| Area                     | Current behavior                                                                                                                                                                                                                                                                                                                         | Evidence / boundary                                                                                                                                                                                                                                                                                           |
++| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| Native continuation      | Claude imports keep `nativeThreadRef` and resume that session on the first follow-up.                                                                                                                                                                                                                                                    | On 2026-10-29, a copied 364 MB real session recalled an earlier conversation topic without tools. After restarting the built server, it recalled a different earlier discussion. Both protocol opens used `resume`, not `sessionId`. An exact `RESUME_OK` response alone does not establish retained context. |
++| Legacy handoff avoidance | Native imports use `historyOrigin: "native"`; `"v1_import"` would make the orchestrator create a legacy context handoff.                                                                                                                                                                                                                 | The first real continuation test failed through the handoff budget; changing the origin made direct native resume pass.                                                                                                                                                                                       |
++| Visible messages         | User and assistant text is imported into current v2 message and turn-item events.                                                                                                                                                                                                                                                        | Scanner/importer tests and isolated projection.                                                                                                                                                                                                                                                               |
++| Claude branch            | Only the current branch is imported. It is found on a parent graph of every main-chain record, because real sessions link prompts and replies through attachment, hook, and timing records the importer does not retain. The leaf is the latest visible message at or after Claude's `last-prompt` marker.                               | A walk over retained records alone stopped after 2–3 records on real sessions and fell back to the whole file, mixing abandoned branches in. The 364 MB session now imports its full 732-prompt branch.                                                                                                       |
++| Provider turns/nodes     | Historical provider turns and execution nodes are emitted with weak native item refs.                                                                                                                                                                                                                                                    | Isolated Claude projection: 9,780 nodes for the 364 MB session.                                                                                                                                                                                                                                               |
++| Claude images            | Inline base64 Claude images are persisted under T3’s attachment store with deterministic IDs and attached to imported messages.                                                                                                                                                                                                          | Target transcript produced 51 persisted image files / 51 unique attachment payloads. Remote image URLs are not downloaded.                                                                                                                                                                                    |
++| Claude subagents         | Native `Agent`/`Task` calls produce subagent nodes, subagent projections, and subagent turn items with prompt/result/status/native task refs.                                                                                                                                                                                            | Target projection produced 24 subagents and 24 subagent turn items.                                                                                                                                                                                                                                           |
++| Claude reasoning/tools   | Thinking blocks become reasoning items. Tool calls go through the live adapter's `claudeToolTurnItem` with the transcript's structured `toolUseResult`, so they render as live Claude tools do: command, file change, web search, or MCP-branded dynamic tool. Tool results are deduplicated by tool ID while reading large transcripts. | Importer test; target projection produced 2,654 command, 243 file change, 29 web search, and 304 dynamic tool items.                                                                                                                                                                                          |
++| Claude compaction        | Compact boundaries on the branch reconnect through `logicalParentUuid` (only toward an older record) and become `compaction` items on the next imported message.                                                                                                                                                                         | Scanner test; 13 of 13 boundaries in the target session.                                                                                                                                                                                                                                                      |
++| Codex native history     | Explicit `source: "codex"` reads full canonical items through app-server, including paginated turns and archived discovery. Commands, exit codes, file changes, plans, exposed reasoning, delegation and compaction use native IDs and terminal statuses.                                                                                | Synthetic parser/source/projection tests and isolated CLI 0.166.0 list/read/resume/restart checks.                                                                                                                                                                                                            |
++| OpenCode 2               | Explicit `source: "opencode"` reads complete session exports, excludes reverted messages, preserves ordered blocks and files, and pages shell output. Tools use the live OpenCode mapper.                                                                                                                                                | Synthetic tests and isolated OpenCode 2.0.28 list/export checks.                                                                                                                                                                                                                                              |
++| Idempotency              | Re-importing an unchanged source is recognized as already imported; event IDs and attachment IDs are deterministic.                                                                                                                                                                                                                      | Importer tests and repeated isolated imports.                                                                                                                                                                                                                                                                 |
++| Restart durability       | v2 projection, provider binding, subagents, turns, and attachments survive server restart.                                                                                                                                                                                                                                               | Isolated restart query verified provider native ID, 2,335 turns, nodes, and attachments.                                                                                                                                                                                                                      |
 +
 +## Intentional limits
 +
@@ -2441,9 +4643,9 @@ index 0000000000..41e4f95f9d
 +- Claude currently imports the selected/current native leaf. Historical alternate
 +  Claude branches are not emitted as separate resumable T3 threads; only the selected
 +  leaf can safely preserve one native resume destination.
-+- Codex tool activity is supported, but Codex-specific native subagent/task shapes,
-+  encrypted reasoning payloads, and provider-private artifacts are not decoded when
-+  the rollout does not expose readable content.
++- Provider-private context, encrypted reasoning and unavailable artifacts cannot
++  be reconstructed from public history APIs. The native provider owns continuation.
++  Delegation activity/results are retained; child conversations import separately.
 +- Remote image URLs are represented only when the source provides inline bytes; the
 +  importer does not fetch network resources during import.
 +- A project’s historical Git branch, worktree checkout, uncommitted files, and
@@ -2472,42 +4674,104 @@ index 0000000000..41e4f95f9d
 +vp run typecheck
 +```
 +
-+The current focused suite passes 311 tests, including regressions for the old
-+selected-history budget, branch walks through unretained records, and compaction.
++The focused suite covers Claude and native-provider import, including selected-history budgets, branch walks through unretained records,
++compaction, native pagination, snapshot checks, attachments, and provider binding.
 +The server typecheck and production server/web build pass.
 +
 +These checks exercise the patched stable build. They do not patch an installed
 +nightly or repair threads already imported there using `historyOrigin: "v1_import"`.
++
++Explicit native imports use provider APIs because raw file layouts are not a stable
++history contract: Codex can paginate or compress history, and OpenCode 2 projects
++its database through export. The raw scanner remains available for existing bulk
++imports. The native source service rejects partial/changing snapshots and mismatched
++instances/workspaces before projection. These checks are not a global writer lock;
++close other native CLI writers before importing.
 diff --git a/packages/contracts/src/agentSessions.ts b/packages/contracts/src/agentSessions.ts
-index a60d702d9a..c13516de06 100644
+index a60d702d9a..a10ab11304 100644
 --- a/packages/contracts/src/agentSessions.ts
 +++ b/packages/contracts/src/agentSessions.ts
-@@ -51,6 +51,8 @@ export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
+@@ -2,7 +2,7 @@ import * as Schema from "effect/Schema";
+ import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+ import { ProviderInstanceId } from "./providerInstance.ts";
+ 
+-export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex"]);
++export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "opencode"]);
+ export type AgentSessionSource = typeof AgentSessionSource.Type;
+ 
+ export const AgentSessionImportSource = Schema.Struct({
+@@ -51,9 +51,32 @@ export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
  export const AgentSessionImportInput = Schema.Struct({
    projectId: ProjectId,
    expectedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
 +  sessionId: Schema.optional(TrimmedNonEmptyString),
 +  includeOlder: Schema.optional(Schema.Boolean),
++  source: Schema.optional(AgentSessionSource),
++  providerInstanceId: Schema.optional(ProviderInstanceId),
  });
  export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;
  
++export const AgentSessionListInput = Schema.Struct({
++  source: Schema.Literals(["codex", "opencode"]),
++  providerInstanceId: Schema.optional(ProviderInstanceId),
++});
++export type AgentSessionListInput = typeof AgentSessionListInput.Type;
++export const AgentSessionListResult = Schema.Struct({
++  sessions: Schema.Array(
++    Schema.Struct({
++      source: Schema.Literals(["codex", "opencode"]),
++      providerInstanceId: ProviderInstanceId,
++      sessionId: TrimmedNonEmptyString,
++      workspaceRoot: TrimmedNonEmptyString,
++      title: Schema.String,
++      updatedAt: IsoDateTime,
++    }),
++  ),
++});
++export type AgentSessionListResult = typeof AgentSessionListResult.Type;
++
+ export class AgentSessionImportProjectNotFoundError extends Schema.TaggedError<AgentSessionImportProjectNotFoundError>()(
+   "AgentSessionImportProjectNotFoundError",
+   { projectId: ProjectId },
+@@ -81,7 +104,7 @@ export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
+ export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanError>()(
+   "AgentSessionScanError",
+   {
+-    operation: Schema.Literals(["read-settings", "read-projects"]),
++    operation: Schema.Literals(["read-settings", "read-projects", "read-native-history"]),
+     cause: Schema.Defect(),
+   },
+ ) {
 diff --git a/packages/contracts/src/environmentHttp.ts b/packages/contracts/src/environmentHttp.ts
-index 330e292181..953443f6f0 100644
+index 330e292181..cbbdf3cf5a 100644
 --- a/packages/contracts/src/environmentHttp.ts
 +++ b/packages/contracts/src/environmentHttp.ts
-@@ -57,6 +57,7 @@ import {
+@@ -57,6 +57,12 @@ import {
    OrchestrationV2ThreadHistoryPage,
    OrchestrationV2ThreadTranscript,
  } from "./orchestrationV2.ts";
-+import { AgentSessionImportInput, AgentSessionImportResult } from "./agentSessions.ts";
++import {
++  AgentSessionImportInput,
++  AgentSessionImportResult,
++  AgentSessionListInput,
++  AgentSessionListResult,
++} from "./agentSessions.ts";
  import { Project, ProjectMutation, ProjectSnapshot } from "./project.ts";
  import {
    PullRequestDiffInput,
-@@ -692,6 +693,16 @@ const EnvironmentOrchestrationThreadHistoryErrors = [
+@@ -692,6 +698,24 @@ const EnvironmentOrchestrationThreadHistoryErrors = [
    EnvironmentInternalError,
  ] as const;
  
 +class EnvironmentAgentSessionsHttpApi extends HttpApiGroup.make("agentSessions")
++  .add(
++    HttpApiEndpoint.post("list", "/api/agent-sessions/list", {
++      headers: OrchestrationProtocolHeaders,
++      payload: AgentSessionListInput,
++      success: AgentSessionListResult,
++      error: EnvironmentOrchestrationSnapshotErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
 +  .add(
 +    HttpApiEndpoint.post("import", "/api/agent-sessions/import", {
 +      headers: OrchestrationProtocolHeaders,
@@ -2520,7 +4784,7 @@ index 330e292181..953443f6f0 100644
  class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
    .add(
      HttpApiEndpoint.get("shellSnapshot", "/api/orchestration/shell", {
-@@ -861,6 +872,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
+@@ -861,6 +885,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
    .add(EnvironmentAuthHttpApi)
    .add(EnvironmentMcpOAuthHttpApi)
    .add(EnvironmentOrchestrationHttpApi)
@@ -2528,6 +4792,21 @@ index 330e292181..953443f6f0 100644
    .add(EnvironmentPullRequestsHttpApi)
    .add(EnvironmentProjectsHttpApi)
    .add(EnvironmentConnectHttpApi)
+diff --git a/packages/provider-opencode/package.json b/packages/provider-opencode/package.json
+index 1517ff3ce9..469a82b5ad 100644
+--- a/packages/provider-opencode/package.json
++++ b/packages/provider-opencode/package.json
+@@ -39,6 +39,10 @@
+       "types": "./src/server/v2/OpenCode2Server.ts",
+       "import": "./src/server/v2/OpenCode2Server.ts"
+     },
++    "./server/toolItems": {
++      "types": "./src/server/toolItems.ts",
++      "import": "./src/server/toolItems.ts"
++    },
+     "./server/v2/textGeneration": {
+       "types": "./src/server/v2/textGeneration.ts",
+       "import": "./src/server/v2/textGeneration.ts"
 diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
 index 96751b0107..395804532d 100644
 --- a/pnpm-lock.yaml
